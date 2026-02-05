@@ -13,4 +13,4 @@ fi
 
 # Run with inline dependencies (defined in web_research.py)
 # Unset PYTHONPATH to avoid conflicts with system Python packages
-env -u PYTHONPATH uv run "$SCRIPT_DIR/web_research.py" "$@"
+env -u PYTHONPATH PYTHONIOENCODING=utf-8 uv run "$SCRIPT_DIR/web_research.py" "$@"

@@ -27,10 +27,16 @@ import asyncio
 import json
 import logging
 import random
+import os
 import re
 import ssl
 import sys
 import time
+
+# Force UTF-8 stdout/stderr on Windows to avoid cp1251/charmap encoding errors
+if sys.platform == "win32" and not os.environ.get("PYTHONIOENCODING"):
+    sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', errors='replace', closefd=False)
+    sys.stderr = open(sys.stderr.fileno(), mode='w', encoding='utf-8', errors='replace', closefd=False)
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
