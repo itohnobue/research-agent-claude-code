@@ -611,7 +611,10 @@ async def fetch_stealth_async(
     """Fetch a single URL using StealthyFetcher (headless browser with anti-bot bypass)."""
     t0 = time.monotonic()
     try:
-        page = await StealthyFetcher.async_fetch(url, headless=True, network_idle=True)
+        page = await asyncio.wait_for(
+            StealthyFetcher.async_fetch(url, headless=True, network_idle=True),
+            timeout=15
+        )
         elapsed = time.monotonic() - t0
 
         if page.status != 200:
@@ -894,22 +897,21 @@ async def run_research_async(
     progress.newline()
     progress.summary(stats.urls_fetched, stats.urls_searched, stats.content_chars)
 
-    # Phase 2: Stealth retry for blocked/403/CAPTCHA pages
+    # Phase 2: Stealth retry for blocked/403/CAPTCHA pages (parallel)
     if stealth_candidates and not config.no_stealth:
         retry_urls = [r.url for r in stealth_candidates[:MAX_STEALTH_RETRIES]]
         progress.message(f"  [stealth] retrying {len(retry_urls)} blocked URLs...")
-        # Reset counters for stealth phase
         progress._ok_count = 0
         progress._failures = []
         progress.phase_start("stealth")
 
+        stealth_results = await asyncio.gather(*(
+            fetch_stealth_async(url, config.min_content_length, config.max_content_length, progress=progress)
+            for url in retry_urls
+        ))
+
         stealth_ok = 0
-        for i, url in enumerate(retry_urls):
-            result = await fetch_stealth_async(
-                url, config.min_content_length, config.max_content_length,
-                progress=progress
-            )
-            progress.update("stealth", i + 1, len(retry_urls))
+        for result in stealth_results:
             if result.success:
                 stealth_ok += 1
                 stats.urls_fetched += 1
