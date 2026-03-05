@@ -790,16 +790,16 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
     )
 
     parser.add_argument("query", help="Search query")
-    parser.add_argument("-s", "--search", type=int, default=50,
-                        help="Number of search results (default: 50)")
+    parser.add_argument("-s", "--search", type=int, default=20,
+                        help="Number of search results (default: 20)")
     parser.add_argument("-f", "--fetch", type=int, default=0,
                         help="Max pages to fetch (default: 0 = fetch ALL)")
     parser.add_argument("-m", "--max-length", type=int, default=4000,
                         help="Max content length per page (default: 4000)")
     parser.add_argument("-o", "--output", choices=["json", "raw", "markdown"], default="raw",
                         help="Output format (default: raw)")
-    parser.add_argument("-t", "--timeout", type=int, default=10,
-                        help="Fetch timeout in seconds (default: 10)")
+    parser.add_argument("-t", "--timeout", type=int, default=5,
+                        help="Fetch timeout in seconds (default: 5)")
     parser.add_argument("-c", "--concurrent", type=int, default=50,
                         help="Max concurrent connections (default: 50)")
     parser.add_argument("-q", "--quiet", action="store_true",
