@@ -1016,6 +1016,8 @@ Examples:
   python web_research.py "Python best practices" -o markdown
   python web_research.py "query" --stream  # Stream output as results arrive
   python web_research.py "query1" "query2" "query3"  # Parallel multi-query
+  python web_research.py --url https://example.com   # Fetch specific URL (skip search)
+  python web_research.py -u url1 url2 url3           # Fetch multiple URLs in parallel
 
 Search: DDG primary + Brave fallback (set BRAVE_API_KEY env var or ~/.config/brave/api_key)
 Fetch: Scrapling AsyncFetcher (TLS fingerprinting) + StealthyFetcher retry
@@ -1024,8 +1026,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         """
     )
 
-    parser.add_argument("query", help="Search query")
+    parser.add_argument("query", nargs="?", help="Search query (omit if using --url)")
     parser.add_argument("extra_queries", nargs="*", help="Additional queries (run in parallel with first)")
+    parser.add_argument("-u", "--url", nargs="+", metavar="URL",
+                        help="Fetch specific URLs directly (skip search)")
     parser.add_argument("-s", "--search", type=int, default=20,
                         help="Number of search results (default: 20)")
     parser.add_argument("-f", "--fetch", type=int, default=0,
@@ -1051,6 +1055,39 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
+
+    # URL-fetch mode: skip search, just fetch specific URLs
+    if args.url:
+        async def fetch_urls():
+            progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
+            results = []
+            tasks = [
+                fetch_single_async(url, args.timeout, 100, args.max_length, progress=progress)
+                for url in args.url
+            ]
+            for result in await asyncio.gather(*tasks):
+                if not result.success and result.error in STEALTH_RETRY_ERRORS and not args.no_stealth:
+                    result = await fetch_stealth_async(result.url, 100, args.max_length, progress=progress)
+                results.append(result)
+            return results
+
+        try:
+            results = asyncio.run(fetch_urls())
+            ok = [r for r in results if r.success]
+            if ok:
+                if args.output == "json":
+                    print(format_batch_json(ok, "url-fetch"))
+                else:
+                    print(format_batch_raw(ok))
+            if not ok:
+                print("All URLs failed to fetch", file=sys.stderr)
+                sys.exit(1)
+        except KeyboardInterrupt:
+            sys.exit(130)
+        sys.exit(0)
+
+    if not args.query:
+        parser.error("query is required (or use --url for direct fetch)")
 
     queries = [args.query] + (args.extra_queries or [])
 
