@@ -826,11 +826,13 @@ def stream_results(
 
 async def run_research_async(
     config: ResearchConfig,
-    progress: ProgressReporter
+    progress: ProgressReporter,
+    global_seen_urls: Optional[Set[str]] = None,
 ) -> AsyncIterator[FetchResult]:
     """
     Async streaming research workflow.
     Yields FetchResult objects as they complete.
+    Pass global_seen_urls to dedup across multiple parallel queries.
     """
     progress.message(f'Researching: "{config.query}"')
 
@@ -853,6 +855,10 @@ async def run_research_async(
             nonlocal ddg_count, brave_count
             prev_count = 0
             for url, title in searcher.search(config.query, config.search_results):
+                if global_seen_urls is not None:
+                    if url in global_seen_urls:
+                        continue
+                    global_seen_urls.add(url)
                 urls.append(url)
                 stats.urls_searched = len(urls)
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
@@ -1081,17 +1087,19 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         logger.setLevel(logging.DEBUG)
 
     # URL-fetch mode: skip search, just fetch specific URLs
+    # Use higher default for direct fetch (user wants the full page, not search snippets)
     if args.url:
+        url_max = args.max_length if "--max-length" in sys.argv or "-m" in sys.argv else 50000
         async def fetch_urls():
             progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
             results = []
             tasks = [
-                fetch_single_async(url, args.timeout, 100, args.max_length, progress=progress)
+                fetch_single_async(url, args.timeout, 100, url_max, progress=progress)
                 for url in args.url
             ]
             for result in await asyncio.gather(*tasks):
                 if not result.success and result.error in STEALTH_RETRY_ERRORS and not args.no_stealth:
-                    result = await fetch_stealth_async(result.url, 100, args.max_length, progress=progress)
+                    result = await fetch_stealth_async(result.url, 100, url_max, progress=progress)
                 results.append(result)
             return results
 
@@ -1151,10 +1159,11 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 cfg.max_concurrent = min(cfg.max_concurrent, 20)
 
             async def run_all():
+                seen: Set[str] = set()  # cross-query URL dedup
                 async def run_one(cfg: ResearchConfig) -> Tuple[str, List[FetchResult]]:
                     progress = ProgressReporter(quiet=cfg.quiet, verbose=args.verbose)
                     results: List[FetchResult] = []
-                    async for result in run_research_async(cfg, progress):
+                    async for result in run_research_async(cfg, progress, global_seen_urls=seen):
                         results.append(result)
                     return cfg.query, results
 
