@@ -340,9 +340,13 @@ _RE_NAV_LISTS = re.compile(
 
 def _strip_boilerplate(html: str) -> Tuple[str, str]:
     """Strip boilerplate tags and extract title. Returns (cleaned_html, title)."""
-    html = _RE_BOILERPLATE.sub("", html)
-    html = _RE_NAV_DIVS.sub("", html)
-    html = _RE_NAV_LISTS.sub("", html)
+    # Skip expensive regex on large HTML — patterns with .*? DOTALL can
+    # cause catastrophic backtracking on malformed pages (100% CPU hang).
+    # w3m handles boilerplate fine on its own.
+    if len(html) < 512_000:
+        html = _RE_BOILERPLATE.sub("", html)
+        html = _RE_NAV_DIVS.sub("", html)
+        html = _RE_NAV_LISTS.sub("", html)
     html = RE_COMMENTS.sub("", html)
 
     title_match = RE_TITLE.search(html)
@@ -1122,6 +1126,9 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         else:
             # Multi-query: run all in parallel
             configs = [make_config(q) for q in queries]
+            # Lower per-query concurrency to avoid resource exhaustion
+            for cfg in configs:
+                cfg.max_concurrent = min(cfg.max_concurrent, 20)
 
             async def run_all():
                 async def run_one(cfg: ResearchConfig) -> Tuple[str, List[FetchResult]]:
@@ -1131,9 +1138,16 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         results.append(result)
                     return cfg.query, results
 
-                return await asyncio.gather(*(run_one(c) for c in configs))
+                return await asyncio.wait_for(
+                    asyncio.gather(*(run_one(c) for c in configs)),
+                    timeout=120,  # hard cap: 2 minutes for all queries
+                )
 
-            all_results = asyncio.run(run_all())
+            try:
+                all_results = asyncio.run(run_all())
+            except asyncio.TimeoutError:
+                print("Multi-query timed out after 120s", file=sys.stderr)
+                sys.exit(1)
 
             for query, results in all_results:
                 if not results:
