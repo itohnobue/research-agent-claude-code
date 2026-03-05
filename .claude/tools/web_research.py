@@ -106,9 +106,20 @@ BLOCKED_CONTENT_MARKERS: Tuple[str, ...] = (
 
 # Navigation text patterns to skip (checked with startswith after lowercasing)
 NAVIGATION_PATTERNS: Tuple[str, ...] = (
-    "skip to",
-    "jump to",
+    "skip to", "jump to", "back to ", "< back", "go to ", "get demo",
+    "learn more", "read more", "see more", "view all", "show more",
+    "sign up", "sign in", "log in", "subscribe", "newsletter",
+    "cookie", "accept all", "privacy policy", "terms of",
+    "share this", "share on", "follow us", "connect with",
+    "published by:", "written by:", "posted by:",
 )
+# Lines matching these exactly (case-insensitive) are noise
+_NOISE_EXACT: Set[str] = {
+    "menu", "close", "search", "home", "blog", "about", "contact",
+    "share", "tweet", "pin", "email", "print", "linkedin", "facebook",
+    "twitter", "instagram", "youtube", "tiktok", "reddit", "rss",
+    "table of contents", "contents", "on this page", "in this article",
+}
 
 # Brave Search API key: set BRAVE_API_KEY env var, or place key in ~/.config/brave/api_key
 BRAVE_API_KEY_PATH = Path(os.environ.get("BRAVE_API_KEY_FILE", str(Path.home() / ".config" / "brave" / "api_key")))
@@ -399,7 +410,7 @@ def extract_text(html: str) -> str:
     # Filter noise from extracted text
     lines = []
     prev_line = ""
-    title_seen = False
+    title_lower = title.lower().strip() if title else ""
 
     for line in text.split("\n"):
         line = line.strip()
@@ -407,18 +418,29 @@ def extract_text(html: str) -> str:
             continue
         if is_navigation_line(line):
             continue
+        line_lower = line.lower()
+        # Skip exact noise words
+        if line_lower in _NOISE_EXACT:
+            continue
         # Skip lines that are mostly symbols (nav remnants)
         alnum_count = sum(1 for c in line if c.isalnum())
         if len(line) > 3 and alnum_count / len(line) < 0.3:
             continue
         if line == prev_line:
             continue
-        # Skip duplicate title
-        if title and not title_seen:
-            line_normalized = re.sub(r'\s*[\|\-\u2013\u2014]\s*[^|\-\u2013\u2014]{3,50}$', '', line)
-            if line_normalized == title:
-                title_seen = True
-                continue
+        # Skip ALL duplicate title occurrences (not just first)
+        if title_lower and title_lower in line_lower and len(line) < len(title) * 2:
+            continue
+        # Skip hex hashes (image/asset remnants like [681cba6a3f])
+        stripped = line.strip("[]() ")
+        if len(stripped) >= 8 and all(c in "0123456789abcdef" for c in stripped):
+            continue
+        # Skip placeholder tokens
+        if stripped in ("[placeholde]", "[placeholder]", "@"):
+            continue
+        # Skip very short lines that are just a name/handle (author bylines)
+        if len(line) < 3:
+            continue
         lines.append(line)
         prev_line = line
 
