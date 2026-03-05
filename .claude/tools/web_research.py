@@ -75,16 +75,18 @@ logger.propagate = False
 BLOCKED_DOMAINS: Tuple[str, ...] = (
     "reddit.com", "twitter.com", "x.com", "facebook.com",
     "youtube.com", "tiktok.com", "instagram.com",
-    "linkedin.com", "medium.com",
+    "linkedin.com",
+    # medium.com: unblocked — full articles extract cleanly
 )
 
 SKIP_URL_PATTERNS: Tuple[str, ...] = (
-    r"\.pdf$", r"\.jpg$", r"\.png$", r"\.gif$",
+    r"\.pdf$", r"\.jpg$", r"\.png$", r"\.gif$", r"\.svg$", r"\.webp$",
     r"/login", r"/signin", r"/signup", r"/cart", r"/checkout",
-    r"amazon\.com/.*/(dp|gp)/", r"ebay\.com/itm/",
     r"/tag/", r"/tags/", r"/category/", r"/categories/",
-    r"/topic/", r"/topics/", r"/archive/", r"/page/\d+",
-    r"/shop/", r"/store/", r"/buy/", r"/product/", r"/products/",
+    r"/archive/", r"/page/\d+",
+    # Removed: amazon/ebay (useful product info),
+    # /product/ /products/ /store/ (blocks review sites and docs),
+    # /topic/ /topics/ (blocks legit content), /shop/ /buy/ (too broad)
 )
 
 
