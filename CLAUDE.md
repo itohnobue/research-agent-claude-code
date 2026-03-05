@@ -2,10 +2,15 @@
 
 For any internet search:
 
-1. Read agent instructions: `.claude/agents/web-searcher.md`
-2. Use internal web search for quick results
-3. Run `./.claude/tools/web_search.sh "query"` (or `.claude/tools/web_search.bat` on Windows) for deep coverage
-4. Synthesize results into a report
+1. Run `./.claude/tools/web_search.sh "query"` for deep coverage (50+ results)
+2. Use `-s N` for result count, `-f N` for fetch limit, `-v` for per-URL timing
+3. Synthesize results into a report
 
-**Note**: Always use forward slashes (`/`) in paths for agent tool run, even on Windows.
+**Note**: Always use forward slashes (`/`) in paths, even on Windows.
 Dependencies handled automatically via uv.
+
+### Search tiers
+- **DDG** primary + **Brave** fallback (set `BRAVE_API_KEY` env var or `~/.config/brave/api_key`)
+- **Scrapling AsyncFetcher** for fast TLS-fingerprinted fetching (bypasses 403s)
+- **StealthyFetcher** auto-retry for blocked/CAPTCHA pages (disable with `--no-stealth`)
+- **Text extraction**: w3m > regex > Scrapling DOM parser (tiered fallback)

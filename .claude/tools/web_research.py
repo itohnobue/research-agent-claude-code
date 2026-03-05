@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx[http2]", "ddgs"]
+# dependencies = ["scrapling[fetchers]", "ddgs"]
 # ///
 # -*- coding: utf-8 -*-
 """
 Web Research Tool - Autonomous Search + Fetch + Report
 
 Unified tool combining search and fetch into a single optimized workflow:
-1. Search via DuckDuckGo (50 results by default)
+1. Search via DuckDuckGo + Brave (fallback) for maximum coverage
 2. Filter and deduplicate URLs during search (early filtering)
-3. Fetch content in parallel with HTTP/2 connection reuse
-4. Output combined results (streaming or batched)
+3. Fetch content in parallel via Scrapling (TLS fingerprinting, anti-bot bypass)
+4. Stealth browser retry for blocked pages (403/CAPTCHA)
+5. Scrapling text extraction fallback for "Too short" pages
+6. Output combined results (streaming or batched)
 
 Usage:
     python web_research.py "search query"
@@ -27,10 +29,8 @@ import asyncio
 import json
 import logging
 import os
-import random
 import re
 import shutil
-import ssl
 import subprocess
 import sys
 import time
@@ -39,6 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from html import unescape
 from io import StringIO
+from pathlib import Path
 from typing import (
     AsyncIterator,
     Iterator,
@@ -52,23 +53,24 @@ from typing import (
 # LOGGING CONFIGURATION
 # =============================================================================
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(levelname)s: %(message)s",
-    stream=sys.stderr
-)
-logger = logging.getLogger(__name__)
+# Suppress ALL library logging before any imports touch the root logger.
+# Scrapling uses logging.info() (root logger) and named loggers — silence both.
+logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
+logging.getLogger().setLevel(logging.CRITICAL)
+for _lib in ("scrapling", "curl_cffi", "httpx", "hpack", "httpcore", "asyncio"):
+    logging.getLogger(_lib).setLevel(logging.CRITICAL)
+
+# Our own logger — restored to WARNING after imports
+logger = logging.getLogger("web_research")
+logger.setLevel(logging.WARNING)
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+logger.addHandler(_handler)
+logger.propagate = False
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-
-USER_AGENTS: Tuple[str, ...] = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
-)
 
 BLOCKED_DOMAINS: Tuple[str, ...] = (
     "reddit.com", "twitter.com", "x.com", "facebook.com",
@@ -108,6 +110,9 @@ NAVIGATION_PATTERNS: Tuple[str, ...] = (
     "jump to",
 )
 
+# Brave Search API key: set BRAVE_API_KEY env var, or place key in ~/.config/brave/api_key
+BRAVE_API_KEY_PATH = Path(os.environ.get("BRAVE_API_KEY_FILE", str(Path.home() / ".config" / "brave" / "api_key")))
+
 # =============================================================================
 # COMPILED REGEX PATTERNS
 # =============================================================================
@@ -122,6 +127,10 @@ _BLOCKED_URL_PATTERN = re.compile(
 RE_STRIP_TAGS = re.compile(r"<(script|style|nav|footer|header|aside|noscript)[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
 RE_COMMENTS = re.compile(r"<!--.*?-->", re.DOTALL)
 RE_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+RE_JSON_LD = re.compile(
+    r"<script[^>]*type\s*=\s*[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+    re.DOTALL | re.IGNORECASE,
+)
 RE_BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
 RE_BLOCK_END = re.compile(r"</(p|div|h[1-6]|li|tr|article|section)>", re.IGNORECASE)
 RE_LI = re.compile(r"<li[^>]*>", re.IGNORECASE)
@@ -138,8 +147,16 @@ W3M_PATH = shutil.which("w3m")
 # REQUIRED DEPENDENCIES (managed by uv)
 # =============================================================================
 
-import httpx
+from scrapling.fetchers import AsyncFetcher, StealthyFetcher
 from ddgs import DDGS
+
+# Scrapling adds its own StreamHandler at INFO — remove it post-import
+_scrapling_logger = logging.getLogger("scrapling")
+_scrapling_logger.handlers.clear()
+_scrapling_logger.setLevel(logging.CRITICAL)
+
+# Errors that warrant a stealth retry (browser-based fetch)
+STEALTH_RETRY_ERRORS = {"HTTP 403", "HTTP 429", "CAPTCHA/blocked"}
 
 # =============================================================================
 # DATA CLASSES
@@ -157,6 +174,7 @@ class ResearchConfig:
     max_concurrent: int = 50  # Match default search count
     search_results: int = 50
     stream: bool = False
+    no_stealth: bool = False
 
 
 @dataclass
@@ -167,7 +185,7 @@ class FetchResult:
     content: str = ""
     title: str = ""
     error: Optional[str] = None
-    source: str = "direct"
+    source: str = "scrapling"
 
 
 @dataclass
@@ -241,10 +259,10 @@ class ProgressReporter:
         rate = (fetched_ok / total * 100) if total > 0 else 0
         rate_indicator = ""
         if rate < 50:
-            rate_indicator = " ⚠ LOW"
+            rate_indicator = " !! LOW"
         elif rate < 70:
-            rate_indicator = " ↓"
-        print(f"  Done: {fetched_ok}/{total} ok ({rate:.0f}%{rate_indicator}) — {chars:,} chars in {total_elapsed:.1f}s", file=sys.stderr)
+            rate_indicator = " !"
+        print(f"  Done: {fetched_ok}/{total} ok ({rate:.0f}%{rate_indicator}) -- {chars:,} chars in {total_elapsed:.1f}s", file=sys.stderr)
 
         if self._failures:
             by_error: dict[str, int] = {}
@@ -260,22 +278,6 @@ class ProgressReporter:
                 for url, elapsed in sorted(slow, key=lambda x: -x[1])[:5]:
                     domain = urllib.parse.urlparse(url).netloc
                     print(f"    {elapsed:4.1f}s  {domain}", file=sys.stderr)
-
-
-# =============================================================================
-# SSL CONTEXT
-# =============================================================================
-
-_SSL_CONTEXT: Optional[ssl.SSLContext] = None
-
-def get_ssl_context() -> ssl.SSLContext:
-    """Get or create reusable SSL context (verification disabled for reliability)."""
-    global _SSL_CONTEXT
-    if _SSL_CONTEXT is None:
-        _SSL_CONTEXT = ssl.create_default_context()
-        _SSL_CONTEXT.check_hostname = False
-        _SSL_CONTEXT.verify_mode = ssl.CERT_NONE
-    return _SSL_CONTEXT
 
 
 # =============================================================================
@@ -345,7 +347,7 @@ def _strip_boilerplate(html: str) -> Tuple[str, str]:
 
     title_match = RE_TITLE.search(html)
     raw_title = unescape(title_match.group(1).strip()) if title_match else ""
-    title = re.sub(r'\s*[\|\-–—]\s*[^|\-–—]{3,50}$', '', raw_title) if raw_title else ""
+    title = re.sub(r'\s*[\|\-\u2013\u2014]\s*[^|\-\u2013\u2014]{3,50}$', '', raw_title) if raw_title else ""
 
     return html, title
 
@@ -370,7 +372,7 @@ def _extract_with_regex(html: str) -> str:
     """Fallback: extract text from HTML using regex."""
     html = RE_BR.sub("\n", html)
     html = RE_BLOCK_END.sub("\n\n", html)
-    html = RE_LI.sub("• ", html)
+    html = RE_LI.sub("\u2022 ", html)
 
     text = RE_ALL_TAGS.sub(" ", html)
     text = unescape(text)
@@ -409,7 +411,7 @@ def extract_text(html: str) -> str:
             continue
         # Skip duplicate title
         if title and not title_seen:
-            line_normalized = re.sub(r'\s*[\|\-–—]\s*[^|\-–—]{3,50}$', '', line)
+            line_normalized = re.sub(r'\s*[\|\-\u2013\u2014]\s*[^|\-\u2013\u2014]{3,50}$', '', line)
             if line_normalized == title:
                 title_seen = True
                 continue
@@ -434,19 +436,62 @@ def extract_title_from_content(content: str) -> str:
     return ""
 
 
-def get_random_user_agent() -> str:
-    """Get a random user agent string."""
-    return random.choice(USER_AGENTS)
+MAX_CONTENT_BYTES = 2_000_000  # 2MB max content size
+
+def extract_jsonld_metadata(html: str) -> str:
+    """Extract only high-value metadata from JSON-LD that page text doesn't provide:
+    dateModified (staleness signal) and FAQPage Q&A pairs (hard to parse from DOM)."""
+    blocks = RE_JSON_LD.findall(html)
+    if not blocks:
+        return ""
+
+    for raw in blocks:
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        if not isinstance(data, dict):
+            continue
+
+        ld_type = data.get("@type", "")
+        if isinstance(ld_type, list):
+            ld_type = ld_type[0] if ld_type else ""
+
+        parts = []
+
+        # FAQPage: Q&A pairs are genuinely hard to extract from rendered HTML
+        if ld_type == "FAQPage":
+            for entity in data.get("mainEntity", [])[:5]:
+                q = entity.get("name", "")
+                a_obj = entity.get("acceptedAnswer", {})
+                a = a_obj.get("text", "") if isinstance(a_obj, dict) else ""
+                if q and a:
+                    parts.append(f"Q: {q}")
+                    parts.append(f"A: {a[:300]}")
+
+        # dateModified: staleness signal not always visible in page text
+        date_mod = data.get("dateModified", "")
+        if date_mod:
+            if "T" in str(date_mod):
+                date_mod = str(date_mod).split("T")[0]
+            parts.append(f"updated: {date_mod}")
+
+        if parts:
+            return "[meta] " + " | ".join(parts) + "\n\n" if len(parts) == 1 else "[meta]\n" + "\n".join(parts) + "\n[/meta]\n\n"
+
+    return ""
 
 
 # =============================================================================
-# URL FETCHER
+# URL FETCHER (Scrapling-based)
 # =============================================================================
 
 def _create_fetch_result(
     url: str,
     content: Optional[str],
-    source: str,
     min_length: int,
     max_length: int
 ) -> FetchResult:
@@ -459,84 +504,203 @@ def _create_fetch_result(
             success=True,
             content=content,
             title=extract_title_from_content(content),
-            source=source
         )
-    return FetchResult(url=url, success=False, error="Content too short or empty")
+    return FetchResult(url=url, success=False, error="Too short")
 
 
-MAX_CONTENT_BYTES = 2_000_000  # 2MB max content size
+def _extract_with_scrapling_fallback(page, min_length: int) -> str:
+    """Try Scrapling's get_all_text() when w3m/regex extraction is too short.
+
+    This handles JS-heavy pages where our regex extraction strips too much
+    but Scrapling's DOM parser preserves the text content.
+    """
+    try:
+        text = page.get_all_text(separator='\n', strip=True)
+        if text and len(text) >= min_length:
+            # Add title if available
+            title = ""
+            title_el = page.css('title')
+            if title_el:
+                raw_title = title_el[0].text.strip() if hasattr(title_el[0], 'text') else ""
+                if raw_title:
+                    title = re.sub(r'\s*[\|\-\u2013\u2014]\s*[^|\-\u2013\u2014]{3,50}$', '', raw_title)
+            if title:
+                return f"# {title}\n\n{text}"
+            return text
+    except Exception:
+        pass
+    return ""
 
 
 async def fetch_single_async(
-    client: httpx.AsyncClient,
     url: str,
     timeout: int,
     min_content_length: int,
     max_content_length: int,
-    user_agent: str = "",
     progress: Optional[ProgressReporter] = None
 ) -> FetchResult:
-    """Fetch single URL (async)."""
+    """Fetch single URL using Scrapling's AsyncFetcher (TLS fingerprinting)."""
     t0 = time.monotonic()
     try:
-        resp = await client.get(
-            url,
-            headers={
-                "User-Agent": user_agent or get_random_user_agent(),
-                "Accept": "text/html,application/xhtml+xml",
-            },
-            timeout=timeout,
-            follow_redirects=True
-        )
+        page = await AsyncFetcher.get(url, timeout=timeout, stealthy_headers=True)
         elapsed = time.monotonic() - t0
-        if resp.status_code == 200:
-            content_length = resp.headers.get('content-length')
-            if content_length and int(content_length) > MAX_CONTENT_BYTES:
-                if progress:
-                    progress.url_result(url, False, elapsed, "Too large")
-                return FetchResult(url=url, success=False, error="Content too large")
 
-            raw_text = resp.text
-            if is_blocked_content(raw_text):
-                if progress:
-                    progress.url_result(url, False, elapsed, "CAPTCHA/blocked")
-                return FetchResult(url=url, success=False, error="CAPTCHA/blocked")
+        if page.status != 200:
+            if progress:
+                progress.url_result(url, False, elapsed, f"HTTP {page.status}")
+            return FetchResult(url=url, success=False, error=f"HTTP {page.status}")
 
-            content = extract_text(raw_text)
-            if len(content) >= min_content_length:
-                result = _create_fetch_result(url, content, "direct", min_content_length, max_content_length)
-                if progress:
-                    progress.url_result(url, True, elapsed)
-                return result
+        raw_html = page.html_content
+        if len(raw_html) > MAX_CONTENT_BYTES:
             if progress:
-                progress.url_result(url, False, elapsed, "Too short")
-            return FetchResult(url=url, success=False, error="Content too short")
-        else:
+                progress.url_result(url, False, elapsed, "Too large")
+            return FetchResult(url=url, success=False, error="Too large")
+
+        if is_blocked_content(raw_html):
             if progress:
-                progress.url_result(url, False, elapsed, f"HTTP {resp.status_code}")
-            return FetchResult(url=url, success=False, error=f"HTTP {resp.status_code}")
-    except httpx.TimeoutException:
+                progress.url_result(url, False, elapsed, "CAPTCHA/blocked")
+            return FetchResult(url=url, success=False, error="CAPTCHA/blocked")
+
+        # Extract structured data (JSON-LD) — prepended to content
+        structured = extract_jsonld_metadata(raw_html)
+
+        # Primary extraction: w3m/regex
+        content = extract_text(raw_html)
+
+        # Fallback: Scrapling's DOM parser when primary extraction is too short
+        if len(content) < min_content_length:
+            scrapling_content = _extract_with_scrapling_fallback(page, min_content_length)
+            if scrapling_content:
+                content = scrapling_content
+
+        # Prepend structured data to content
+        if structured:
+            content = structured + content
+
+        result = _create_fetch_result(url, content, min_content_length, max_content_length)
+        if progress:
+            progress.url_result(url, result.success, elapsed, result.error or "")
+        return result
+
+    except asyncio.TimeoutError:
         elapsed = time.monotonic() - t0
         if progress:
             progress.url_result(url, False, elapsed, "Timeout")
         return FetchResult(url=url, success=False, error="Timeout")
-    except httpx.RequestError as e:
+    except Exception as e:
         elapsed = time.monotonic() - t0
-        logger.debug(f"Request error for {url}: {e}")
+        error_msg = str(e)[:50] if str(e) else type(e).__name__
+        logger.debug(f"Fetch error for {url}: {e}")
         if progress:
-            progress.url_result(url, False, elapsed, "Request error")
-        return FetchResult(url=url, success=False, error="Request error")
-    except httpx.HTTPStatusError as e:
-        elapsed = time.monotonic() - t0
-        logger.debug(f"HTTP status error for {url}: {e}")
-        if progress:
-            progress.url_result(url, False, elapsed, f"HTTP {e.response.status_code}")
-        return FetchResult(url=url, success=False, error=f"HTTP {e.response.status_code}")
+            progress.url_result(url, False, elapsed, error_msg)
+        return FetchResult(url=url, success=False, error=error_msg)
 
 
 # =============================================================================
-# DUCKDUCKGO SEARCH
+# STEALTH FETCHER (browser-based retry for blocked pages)
 # =============================================================================
+
+MAX_STEALTH_RETRIES = 5  # Cap to avoid slowing down the whole search
+
+async def fetch_stealth_async(
+    url: str,
+    min_content_length: int,
+    max_content_length: int,
+    progress: Optional[ProgressReporter] = None
+) -> FetchResult:
+    """Fetch a single URL using StealthyFetcher (headless browser with anti-bot bypass)."""
+    t0 = time.monotonic()
+    try:
+        page = await StealthyFetcher.async_fetch(url, headless=True, network_idle=True)
+        elapsed = time.monotonic() - t0
+
+        if page.status != 200:
+            if progress:
+                progress.url_result(url, False, elapsed, f"Stealth HTTP {page.status}")
+            return FetchResult(url=url, success=False, error=f"Stealth HTTP {page.status}", source="stealth")
+
+        raw_html = page.html_content
+        if is_blocked_content(raw_html):
+            if progress:
+                progress.url_result(url, False, elapsed, "Stealth still blocked")
+            return FetchResult(url=url, success=False, error="Stealth still blocked", source="stealth")
+
+        structured = extract_jsonld_metadata(raw_html)
+        content = extract_text(raw_html)
+        if len(content) < min_content_length:
+            scrapling_content = _extract_with_scrapling_fallback(page, min_content_length)
+            if scrapling_content:
+                content = scrapling_content
+        if structured:
+            content = structured + content
+
+        result = _create_fetch_result(url, content, min_content_length, max_content_length)
+        result.source = "stealth"
+        if progress:
+            progress.url_result(url, result.success, elapsed, result.error or "")
+        return result
+
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        error_msg = str(e)[:50] if str(e) else type(e).__name__
+        if progress:
+            progress.url_result(url, False, elapsed, f"Stealth: {error_msg}")
+        return FetchResult(url=url, success=False, error=f"Stealth: {error_msg}", source="stealth")
+
+
+# =============================================================================
+# SEARCH BACKENDS
+# =============================================================================
+
+def _load_brave_api_key() -> Optional[str]:
+    """Load Brave Search API key from env var or config file."""
+    key = os.environ.get("BRAVE_API_KEY", "")
+    if key:
+        return key
+    try:
+        return BRAVE_API_KEY_PATH.read_text().strip()
+    except (FileNotFoundError, PermissionError):
+        return None
+
+
+class BraveSearch:
+    """Brave Search API backend."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def search(
+        self,
+        query: str,
+        num_results: int = 20,
+    ) -> Iterator[Tuple[str, str]]:
+        """Search Brave and yield (url, title) tuples."""
+        import urllib.request
+
+        encoded = urllib.parse.quote_plus(query)
+        url = f"https://api.search.brave.com/res/v1/web/search?q={encoded}&count={min(num_results, 20)}"
+        req = urllib.request.Request(url, headers={
+            "X-Subscription-Token": self.api_key,
+            "Accept": "application/json",
+        })
+
+        seen_urls: Set[str] = set()
+        count = 0
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            for r in data.get("web", {}).get("results", []):
+                result_url = r.get("url", "")
+                if result_url and result_url not in seen_urls and is_valid_url(result_url) and not is_blocked_url(result_url):
+                    seen_urls.add(result_url)
+                    yield result_url, r.get("title", "")
+                    count += 1
+                    if count >= num_results:
+                        return
+        except Exception as e:
+            logger.debug(f"Brave search failed: {e}")
+            return
+
 
 class DuckDuckGoSearch:
     """DuckDuckGo search with early URL filtering."""
@@ -562,6 +726,42 @@ class DuckDuckGoSearch:
                 count += 1
                 if count >= num_results:
                     return
+
+
+class MultiSearch:
+    """Combined search: DDG primary, Brave fallback for coverage gaps."""
+
+    def __init__(self):
+        self._brave_key = _load_brave_api_key()
+
+    def search(
+        self,
+        query: str,
+        num_results: int = 20,
+    ) -> Iterator[Tuple[str, str]]:
+        """Search DDG first. If under target, supplement with Brave."""
+        seen_urls: Set[str] = set()
+        count = 0
+
+        # Phase 1: DuckDuckGo (primary)
+        ddg = DuckDuckGoSearch()
+        for url, title in ddg.search(query, num_results):
+            if url not in seen_urls:
+                seen_urls.add(url)
+                yield url, title
+                count += 1
+
+        # Phase 2: Brave (supplement if DDG fell short)
+        shortfall = num_results - count
+        if shortfall > 0 and self._brave_key:
+            brave = BraveSearch(self._brave_key)
+            for url, title in brave.search(query, shortfall + 5):  # request extra to account for dupes
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    yield url, title
+                    count += 1
+                    if count >= num_results:
+                        return
 
 
 # =============================================================================
@@ -612,39 +812,51 @@ async def run_research_async(
     fetch_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
     result_queue: asyncio.Queue[Optional[FetchResult]] = asyncio.Queue()
     stats = ResearchStats(query=config.query)
-    search_elapsed: float = 0
+    search_source = ""
 
     async def search_producer() -> None:
-        nonlocal search_elapsed
+        nonlocal search_source
         loop = asyncio.get_event_loop()
-        ddg = DuckDuckGoSearch()
+        searcher = MultiSearch()
         t0 = time.monotonic()
 
+        ddg_count = 0
+        brave_count = 0
+
         def search_and_stream():
-            for url, title in ddg.search(config.query, config.search_results):
+            nonlocal ddg_count, brave_count
+            prev_count = 0
+            for url, title in searcher.search(config.query, config.search_results):
                 urls.append(url)
                 stats.urls_searched = len(urls)
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
+
+            # Count sources (DDG fills first, Brave supplements)
+            # We can't easily distinguish here, but MultiSearch logs internally
+            ddg_count = len(urls)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             await loop.run_in_executor(executor, search_and_stream)
 
         search_elapsed = time.monotonic() - t0
-        progress.message(f"  [search] {stats.urls_searched} URLs in {search_elapsed:.1f}s")
+        source_info = f"{stats.urls_searched} URLs"
+        if searcher._brave_key:
+            source_info += " (DDG+Brave)"
+        else:
+            source_info += " (DDG)"
+        progress.message(f"  [search] {source_info} in {search_elapsed:.1f}s")
         await fetch_queue.put(None)
 
-    async def fetch_consumer(client: httpx.AsyncClient) -> None:
+    async def fetch_consumer() -> None:
         semaphore = asyncio.Semaphore(config.max_concurrent)
         pending: List[asyncio.Task] = []
         fetch_limit = config.fetch_count
-        session_ua = get_random_user_agent()
 
         async def fetch_one(url: str) -> None:
             async with semaphore:
                 result = await fetch_single_async(
-                    client, url, config.timeout,
+                    url, config.timeout,
                     config.min_content_length, config.max_content_length,
-                    user_agent=session_ua,
                     progress=progress
                 )
                 await result_queue.put(result)
@@ -661,33 +873,51 @@ async def run_research_async(
         await result_queue.put(None)
 
     progress.phase_start("fetch")
-    async with httpx.AsyncClient(
-        verify=False,
-        http2=True,
-        limits=httpx.Limits(
-            max_connections=config.max_concurrent,
-            max_keepalive_connections=config.max_concurrent,
-            keepalive_expiry=30.0
-        ),
-        timeout=httpx.Timeout(config.timeout, connect=5.0)
-    ) as client:
-        asyncio.create_task(search_producer())
-        asyncio.create_task(fetch_consumer(client))
+    asyncio.create_task(search_producer())
+    asyncio.create_task(fetch_consumer())
 
-        fetched = 0
-        while True:
-            result = await result_queue.get()
-            if result is None:
-                break
-            fetched += 1
-            if result.success:
-                stats.urls_fetched += 1
-                stats.content_chars += len(result.content)
-            progress.update("fetch", fetched, stats.urls_searched or fetched)
-            yield result
+    fetched = 0
+    stealth_candidates: List[FetchResult] = []
+    while True:
+        result = await result_queue.get()
+        if result is None:
+            break
+        fetched += 1
+        if result.success:
+            stats.urls_fetched += 1
+            stats.content_chars += len(result.content)
+        elif result.error in STEALTH_RETRY_ERRORS:
+            stealth_candidates.append(result)
+        progress.update("fetch", fetched, stats.urls_searched or fetched)
+        yield result
 
     progress.newline()
     progress.summary(stats.urls_fetched, stats.urls_searched, stats.content_chars)
+
+    # Phase 2: Stealth retry for blocked/403/CAPTCHA pages
+    if stealth_candidates and not config.no_stealth:
+        retry_urls = [r.url for r in stealth_candidates[:MAX_STEALTH_RETRIES]]
+        progress.message(f"  [stealth] retrying {len(retry_urls)} blocked URLs...")
+        # Reset counters for stealth phase
+        progress._ok_count = 0
+        progress._failures = []
+        progress.phase_start("stealth")
+
+        stealth_ok = 0
+        for i, url in enumerate(retry_urls):
+            result = await fetch_stealth_async(
+                url, config.min_content_length, config.max_content_length,
+                progress=progress
+            )
+            progress.update("stealth", i + 1, len(retry_urls))
+            if result.success:
+                stealth_ok += 1
+                stats.urls_fetched += 1
+                stats.content_chars += len(result.content)
+            yield result
+
+        progress.newline()
+        progress.message(f"  [stealth] {stealth_ok}/{len(retry_urls)} recovered")
 
 
 # =============================================================================
@@ -776,7 +1006,7 @@ def run_research(config: ResearchConfig, verbose: bool = False) -> Optional[List
 def main() -> None:
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Web Research Tool - Autonomous Search + Fetch",
+        description="Web Research Tool - Search + Fetch with TLS fingerprinting (Scrapling)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -785,6 +1015,9 @@ Examples:
   python web_research.py "Python best practices" -o markdown
   python web_research.py "query" --stream  # Stream output as results arrive
 
+Search: DDG primary + Brave fallback (set BRAVE_API_KEY env var or ~/.config/brave/api_key)
+Fetch: Scrapling AsyncFetcher (TLS fingerprinting) + StealthyFetcher retry
+Extract: w3m > regex > Scrapling DOM parser (tiered fallback)
 Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin, medium
         """
     )
@@ -808,6 +1041,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Enable verbose logging")
     parser.add_argument("--stream", action="store_true",
                         help="Stream output as results arrive (reduces memory usage)")
+    parser.add_argument("--no-stealth", action="store_true",
+                        help="Disable stealth browser retry for blocked pages")
 
     args = parser.parse_args()
 
@@ -823,6 +1058,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         max_concurrent=args.concurrent,
         search_results=args.search,
         stream=args.stream,
+        no_stealth=args.no_stealth,
     )
 
     try:
