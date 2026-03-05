@@ -1024,7 +1024,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         """
     )
 
-    parser.add_argument("query", nargs="+", help="Search query (multiple queries run in parallel)")
+    parser.add_argument("query", help="Search query")
+    parser.add_argument("extra_queries", nargs="*", help="Additional queries (run in parallel with first)")
     parser.add_argument("-s", "--search", type=int, default=20,
                         help="Number of search results (default: 20)")
     parser.add_argument("-f", "--fetch", type=int, default=0,
@@ -1051,7 +1052,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    queries = args.query
+    queries = [args.query] + (args.extra_queries or [])
 
     def make_config(query: str) -> ResearchConfig:
         return ResearchConfig(
