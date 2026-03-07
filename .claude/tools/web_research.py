@@ -1272,7 +1272,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
 
     args = parser.parse_args()
 
-    if args.usage:
+    if args.usage or args.quality:
         print_usage_stats(quality=args.quality)
         sys.exit(0)
 
@@ -1452,6 +1452,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
     except KeyboardInterrupt:
         print("\nInterrupted", file=sys.stderr)
         sys.exit(130)
+    except BrokenPipeError:
+        # Output pipe closed (e.g. piped to head) — not a real error
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
     except Exception as e:
         log_usage({
             "query": queries[0] if queries else "", "mode": "search",

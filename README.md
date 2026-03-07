@@ -83,14 +83,34 @@ Slow URLs (>5s) are always listed in the summary, even without `-v`.
 -m N          Max chars per page (default: 15000)
 -o FORMAT     Output format: text (default), json, raw, markdown
 -v            Verbose: show per-URL timing
+--url URL ... Direct URL fetch (skip search)
 --stream      Stream results as they arrive
 --no-stealth  Disable headless browser retry for blocked pages
+--usage       Show usage statistics (last 30 days)
+--quality     Show usage stats with output quality analysis
+```
+
+## Multi-Query
+
+Run multiple searches in parallel with cross-query URL deduplication:
+
+```bash
+web_search.sh "query1" "query2" "query3" -s 10
+```
+
+## Direct URL Fetch
+
+Fetch specific URLs without searching (also available via `scrape.sh`):
+
+```bash
+web_search.sh --url https://example.com https://other.com
+scrape.sh https://example.com   # shorthand
 ```
 
 ## Blocked Domains
 
 Automatically filtered (require login or block scraping):
-reddit.com, twitter.com, x.com, facebook.com, youtube.com, tiktok.com, instagram.com, linkedin.com, medium.com
+reddit.com, twitter.com, x.com, facebook.com, youtube.com, tiktok.com, instagram.com, linkedin.com
 
 ## License
 
