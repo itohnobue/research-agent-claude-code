@@ -210,6 +210,126 @@ class ResearchStats:
     content_chars: int = 0
 
 
+def _quality_fields(results: Optional[List[FetchResult]]) -> dict:
+    """Extract quality-related fields from fetch results."""
+    if not results:
+        return {"short_pages": 0, "domains": [], "stealth_retries": 0}
+    return {
+        "short_pages": sum(1 for r in results if r.success and len(r.content) < 200),
+        "domains": list({urllib.parse.urlparse(r.url).netloc for r in results if r.success}),
+        "stealth_retries": sum(1 for r in results if r.source == "stealth"),
+    }
+
+
+def log_usage(event: dict) -> None:
+    """Append one JSONL event to ~/.web-research/usage.jsonl."""
+    try:
+        log_dir = os.path.join(os.path.expanduser("~"), ".web-research")
+        os.makedirs(log_dir, exist_ok=True)
+        event["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        with open(os.path.join(log_dir, "usage.jsonl"), "a") as f:
+            f.write(json.dumps(event) + "\n")
+    except Exception:
+        pass
+
+
+def print_usage_stats(quality: bool = False) -> None:
+    """Print usage statistics from ~/.web-research/usage.jsonl."""
+    log_path = os.path.join(os.path.expanduser("~"), ".web-research", "usage.jsonl")
+    if not os.path.exists(log_path):
+        print("No usage data yet", file=sys.stderr)
+        sys.exit(0)
+
+    from collections import Counter
+    from datetime import datetime, timedelta
+
+    cutoff = datetime.now().astimezone() - timedelta(days=30)
+    events = []
+    errors: Counter = Counter()
+    modes: Counter = Counter()
+    days: Counter = Counter()
+    domain_ok: Counter = Counter()    # domain → successful fetches
+    domain_short: Counter = Counter()  # domain → short page count
+
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            try:
+                ts = datetime.fromisoformat(ev["ts"])
+                if ts < cutoff:
+                    continue
+            except (KeyError, ValueError):
+                continue
+            events.append(ev)
+            modes[ev.get("mode", "unknown")] += 1
+            day = ev["ts"][:10]
+            days[day] += 1
+            if not ev.get("ok") and ev.get("error"):
+                errors[ev["error"]] += 1
+            for d in ev.get("domains", []):
+                domain_ok[d] += 1
+
+    if not events:
+        print("No usage data in last 30 days")
+        sys.exit(0)
+
+    total = len(events)
+    ok_count = sum(1 for e in events if e.get("ok"))
+    avg_ms = sum(e.get("ms", 0) for e in events) / total
+    timeouts = sum(1 for e in events if e.get("timeout"))
+    avg_fetched = sum(e.get("urls_fetched", 0) for e in events) / total
+    avg_chars = sum(e.get("content_chars", 0) for e in events) / total
+    total_short = sum(e.get("short_pages", 0) for e in events)
+    total_fetched = sum(e.get("urls_fetched", 0) for e in events)
+    total_stealth = sum(e.get("stealth_retries", 0) for e in events)
+
+    print(f"Web Research Usage (last 30 days)")
+    print(f"{'='*40}")
+    print(f"Total searches:    {total}")
+    print(f"Success rate:      {ok_count}/{total} ({100*ok_count/total:.0f}%)")
+    print(f"Avg latency:       {avg_ms/1000:.1f}s")
+    print(f"Timeouts:          {timeouts}")
+    print()
+    print(f"Mode breakdown:")
+    for mode, count in modes.most_common():
+        print(f"  {mode:15s} {count:4d} ({100*count/total:.0f}%)")
+    print()
+    print(f"Fetch efficiency:")
+    print(f"  Avg URLs fetched:  {avg_fetched:.1f}")
+    print(f"  Avg content chars: {avg_chars:.0f}")
+
+    if quality:
+        print()
+        print(f"Output quality:")
+        print(f"  Short pages (<200 chars): {total_short}/{total_fetched}" +
+              (f" ({100*total_short/total_fetched:.0f}%)" if total_fetched else ""))
+        print(f"  Stealth retries:          {total_stealth}")
+        if total_stealth and total_fetched:
+            print(f"  Stealth retry rate:       {100*total_stealth/total_fetched:.0f}%")
+        print()
+        print(f"Top domains (by fetch count):")
+        for domain, count in domain_ok.most_common(10):
+            print(f"  {count:4d}x {domain}")
+
+    if errors:
+        print()
+        print(f"Top errors:")
+        for err, count in errors.most_common(5):
+            print(f"  {count:4d}x {err[:80]}")
+
+    if days:
+        print()
+        print(f"Busiest days:")
+        for day, count in days.most_common(5):
+            print(f"  {day}  {count} searches")
+
+
 # =============================================================================
 # PROGRESS REPORTER (Unified)
 # =============================================================================
@@ -1145,8 +1265,16 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Stream output as results arrive (reduces memory usage)")
     parser.add_argument("--no-stealth", action="store_true",
                         help="Disable stealth browser retry for blocked pages")
+    parser.add_argument("--usage", action="store_true",
+                        help="Show usage statistics (last 30 days)")
+    parser.add_argument("--quality", action="store_true",
+                        help="Include output quality analysis (with --usage)")
 
     args = parser.parse_args()
+
+    if args.usage:
+        print_usage_stats(quality=args.quality)
+        sys.exit(0)
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -1168,9 +1296,18 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 results.append(result)
             return results
 
+        t0 = time.monotonic()
         try:
             results = asyncio.run(fetch_urls())
             ok = [r for r in results if r.success]
+            log_usage({
+                "query": "", "mode": "url-fetch", "urls_searched": 0,
+                "urls_fetched": len(ok),
+                "content_chars": sum(len(r.content) for r in results),
+                "ok": bool(ok), "error": None,
+                "ms": int((time.monotonic() - t0) * 1000), "timeout": False,
+                **_quality_fields(results),
+            })
             if ok:
                 if args.output == "json":
                     print(format_batch_json(ok, "url-fetch"))
@@ -1201,14 +1338,49 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             no_stealth=args.no_stealth,
         )
 
+    # Hard wall-clock timeout: kill the entire process after 5 minutes
+    import signal
+    _wall_t0 = time.monotonic()
+    def _timeout_handler(signum, frame):
+        for q in queries:
+            log_usage({
+                "query": q, "mode": "multi" if len(queries) > 1 else "search",
+                "urls_searched": 0, "urls_fetched": 0, "content_chars": 0,
+                "ok": False, "error": "wall-clock timeout",
+                "ms": int((time.monotonic() - _wall_t0) * 1000), "timeout": True,
+                "short_pages": 0, "domains": [], "stealth_retries": 0,
+            })
+        print(f"\nwall-clock timeout ({_WALL_TIMEOUT}s) — exiting", file=sys.stderr)
+        os._exit(1)  # kills child processes (ProcessPoolExecutor workers)
+    _WALL_TIMEOUT = 300
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(_WALL_TIMEOUT)
+
     try:
         if len(queries) == 1:
             # Single query: original behavior
             config = make_config(queries[0])
+            t0 = time.monotonic()
             if args.stream:
                 run_research(config, verbose=args.verbose)
+                log_usage({
+                    "query": config.query, "mode": "search",
+                    "urls_fetched": 0, "content_chars": 0,
+                    "ok": True, "error": None,
+                    "ms": int((time.monotonic() - t0) * 1000), "timeout": False,
+                    "short_pages": 0, "domains": [], "stealth_retries": 0,
+                })
             else:
                 results = run_research(config, verbose=args.verbose)
+                ok = [r for r in (results or []) if r.success]
+                log_usage({
+                    "query": config.query, "mode": "search",
+                    "urls_fetched": len(ok),
+                    "content_chars": sum(len(r.content) for r in (results or [])),
+                    "ok": bool(results), "error": None,
+                    "ms": int((time.monotonic() - t0) * 1000), "timeout": False,
+                    **_quality_fields(results),
+                })
                 if results:
                     if args.output == "json":
                         print(format_batch_json(results, config.query))
@@ -1222,6 +1394,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             # Lower per-query concurrency to avoid resource exhaustion
             for cfg in configs:
                 cfg.max_concurrent = min(cfg.max_concurrent, 20)
+
+            t0_multi = time.monotonic()
 
             async def run_all():
                 seen: Set[str] = set()  # cross-query URL dedup
@@ -1240,10 +1414,28 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             try:
                 all_results = asyncio.run(run_all())
             except asyncio.TimeoutError:
+                elapsed = int((time.monotonic() - t0_multi) * 1000)
+                for q in queries:
+                    log_usage({
+                        "query": q, "mode": "multi",
+                        "urls_fetched": 0, "content_chars": 0,
+                        "ok": False, "error": "multi-query timeout (120s)",
+                        "ms": elapsed, "timeout": True,
+                    })
                 print("Multi-query timed out after 120s", file=sys.stderr)
                 sys.exit(1)
 
+            elapsed = int((time.monotonic() - t0_multi) * 1000)
             for query, results in all_results:
+                ok = [r for r in results if r.success]
+                log_usage({
+                    "query": query, "mode": "multi",
+                    "urls_fetched": len(ok),
+                    "content_chars": sum(len(r.content) for r in results),
+                    "ok": bool(results), "error": None,
+                    "ms": elapsed, "timeout": False,
+                    **_quality_fields(results),
+                })
                 if not results:
                     continue
                 if args.output == "json":
@@ -1261,6 +1453,12 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         print("\nInterrupted", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
+        log_usage({
+            "query": queries[0] if queries else "", "mode": "search",
+            "urls_fetched": 0, "content_chars": 0,
+            "ok": False, "error": str(e)[:200],
+            "ms": int((time.monotonic() - _wall_t0) * 1000), "timeout": False,
+        })
         logger.exception(f"Research failed: {e}")
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
