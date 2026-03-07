@@ -609,15 +609,17 @@ def _compress_with_bm25(content: str, query: str, max_length: int) -> str:
 
     # Centrality scoring: sentences similar to many others are "hub" sentences
     # (captures important context that BM25 misses when it lacks query terms)
+    # Cap at 200 sentences to keep O(n²) manageable (~40K comparisons max)
     word_sets = [set(t) for t in tokenized]
     n = len(sentences)
     centrality = [0.0] * n
-    if n > 1:
-        for i in range(n):
+    n_cap = min(n, 200)
+    if n_cap > 1:
+        for i in range(n_cap):
             if not word_sets[i]:
                 continue
             total_sim = 0.0
-            for j in range(n):
+            for j in range(n_cap):
                 if i == j or not word_sets[j]:
                     continue
                 # Jaccard similarity
@@ -625,7 +627,7 @@ def _compress_with_bm25(content: str, query: str, max_length: int) -> str:
                 union = len(word_sets[i] | word_sets[j])
                 if union:
                     total_sim += intersection / union
-            centrality[i] = total_sim / (n - 1)
+            centrality[i] = total_sim / (n_cap - 1)
 
     # Blend: 70% BM25 relevance + 30% centrality importance
     max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
@@ -752,6 +754,18 @@ def _get_extract_pool() -> ProcessPoolExecutor:
     if _extract_pool is None:
         _extract_pool = ProcessPoolExecutor(max_workers=4)
     return _extract_pool
+
+
+def _shutdown_extract_pool() -> None:
+    """Shut down process pool to prevent hang on exit."""
+    global _extract_pool
+    if _extract_pool is not None:
+        _extract_pool.shutdown(wait=False, cancel_futures=True)
+        _extract_pool = None
+
+
+import atexit
+atexit.register(_shutdown_extract_pool)
 
 
 async def fetch_single_async(
@@ -1074,11 +1088,11 @@ async def run_research_async(
 
         ddg_count = 0
         brave_count = 0
+        skipped = 0
 
         def search_and_stream():
-            nonlocal ddg_count, brave_count
+            nonlocal ddg_count, brave_count, skipped
             enqueued = 0
-            skipped = 0
             for url, title, snippet in searcher.search(config.query, config.search_results):
                 if global_seen_urls is not None:
                     if url in global_seen_urls:
@@ -1187,25 +1201,61 @@ async def run_research_async(
 # CROSS-PAGE DEDUPLICATION
 # =============================================================================
 
+# Common English stop words for fuzzy dedup signatures
+_STOP_WORDS = frozenset(
+    "a an the and or but in on at to for of is it its be by as was were are been "
+    "has have had do does did will would shall should can could may might this that "
+    "these those with from not no nor so if then than too also very just about above "
+    "after before between each few more most other some such only own same through "
+    "during until while into over under again further once here there when where why "
+    "how all any both each which what who whom".split()
+)
+
+
 def _normalize_sentence(s: str) -> str:
-    """Normalize a sentence for dedup comparison: lowercase, strip punctuation, collapse whitespace."""
+    """Normalize a sentence for exact dedup: lowercase, strip punctuation, collapse whitespace."""
     s = s.lower().strip()
     s = re.sub(r'[^\w\s]', '', s)
     return RE_WHITESPACE.sub(' ', s)
 
 
-def _dedup_results(results: List[FetchResult], seen: Optional[Set[str]] = None) -> List[FetchResult]:
-    """Remove duplicate sentences across pages. Earlier pages take priority.
-    Pass a shared `seen` set to dedup across multiple calls (e.g. multi-query)."""
+def _content_signature(s: str) -> str:
+    """Content-word signature for fuzzy dedup. Strips stop words, sorts remaining → key.
+    Two sentences with the same content words in any order match."""
+    words = sorted(w for w in s.lower().split() if w not in _STOP_WORDS and len(w) > 2)
+    return " ".join(words)
+
+
+@dataclass
+class DedupStats:
+    """Track dedup savings."""
+    chars_before: int = 0
+    chars_after: int = 0
+    exact_dupes: int = 0
+    fuzzy_dupes: int = 0
+    pages_dropped: int = 0
+
+
+def _dedup_results(
+    results: List[FetchResult],
+    seen: Optional[Set[str]] = None,
+    seen_fuzzy: Optional[Set[str]] = None,
+) -> List[FetchResult]:
+    """Remove duplicate sentences across pages (exact + fuzzy).
+    Pass shared sets to dedup across multiple calls (e.g. multi-query)."""
     if seen is None:
         seen = set()
+    if seen_fuzzy is None:
+        seen_fuzzy = set()
     deduped: List[FetchResult] = []
+    stats = DedupStats()
 
     for r in results:
         if not r.success:
             deduped.append(r)
             continue
 
+        stats.chars_before += len(r.content)
         lines = r.content.split("\n")
         kept: List[str] = []
         for line in lines:
@@ -1221,15 +1271,25 @@ def _dedup_results(results: List[FetchResult], seen: Optional[Set[str]] = None) 
             if len(stripped) < 40:
                 kept.append(line)
                 continue
+            # Exact dedup (normalized)
             norm = _normalize_sentence(stripped)
             if norm in seen:
-                continue  # duplicate — skip
+                stats.exact_dupes += 1
+                continue
             seen.add(norm)
+            # Fuzzy dedup (content-word signature)
+            sig = _content_signature(norm)
+            if sig and len(sig) > 10 and sig in seen_fuzzy:
+                stats.fuzzy_dupes += 1
+                continue
+            if sig and len(sig) > 10:
+                seen_fuzzy.add(sig)
             kept.append(line)
 
         new_content = "\n".join(kept).strip()
+        stats.chars_after += len(new_content)
         if len(new_content) < 50:
-            # Page reduced to nothing after dedup — drop it
+            stats.pages_dropped += 1
             continue
         deduped.append(FetchResult(
             url=r.url,
@@ -1239,7 +1299,16 @@ def _dedup_results(results: List[FetchResult], seen: Optional[Set[str]] = None) 
             source=r.source,
         ))
 
-    return deduped
+    # Log dedup effectiveness to stderr (visible with -v)
+    if stats.chars_before > 0 and (stats.exact_dupes or stats.fuzzy_dupes):
+        saved_pct = 100 * (1 - stats.chars_after / stats.chars_before)
+        logger.debug(
+            f"Dedup: {stats.chars_before:,} → {stats.chars_after:,} chars "
+            f"({saved_pct:.0f}% saved, {stats.exact_dupes} exact + {stats.fuzzy_dupes} fuzzy dupes, "
+            f"{stats.pages_dropped} pages dropped)"
+        )
+
+    return deduped, stats
 
 
 # =============================================================================
@@ -1308,9 +1377,12 @@ def run_research(config: ResearchConfig, verbose: bool = False) -> Optional[List
     if config.stream:
         # Streaming mode: output results as they arrive
         async def stream_async():
-            async for result in run_research_async(config, progress):
-                if result.success:
-                    print(format_result_raw(result))
+            try:
+                async for result in run_research_async(config, progress):
+                    if result.success:
+                        print(format_result_raw(result))
+            finally:
+                _shutdown_extract_pool()
         asyncio.run(stream_async())
         return None
 
@@ -1318,8 +1390,11 @@ def run_research(config: ResearchConfig, verbose: bool = False) -> Optional[List
     results: List[FetchResult] = []
 
     async def collect_async():
-        async for result in run_research_async(config, progress):
-            results.append(result)
+        try:
+            async for result in run_research_async(config, progress):
+                results.append(result)
+        finally:
+            _shutdown_extract_pool()
     asyncio.run(collect_async())
 
     return results
@@ -1490,7 +1565,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                     **_quality_fields(results),
                 })
                 if results:
-                    results = _dedup_results(results)
+                    results, dedup_st = _dedup_results(results)
                     if args.output == "json":
                         print(format_batch_json(results, config.query))
                     elif args.output == "markdown":
@@ -1536,6 +1611,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
 
             elapsed = int((time.monotonic() - t0_multi) * 1000)
             dedup_seen: Set[str] = set()  # shared across queries
+            dedup_fuzzy: Set[str] = set()
             for query, results in all_results:
                 ok = [r for r in results if r.success]
                 log_usage({
@@ -1548,7 +1624,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 })
                 if not results:
                     continue
-                results = _dedup_results(results, seen=dedup_seen)
+                results, _ = _dedup_results(results, seen=dedup_seen, seen_fuzzy=dedup_fuzzy)
                 if args.output == "json":
                     print(format_batch_json(results, query))
                 elif args.output == "markdown":
