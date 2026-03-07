@@ -1300,11 +1300,13 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         try:
             results = asyncio.run(fetch_urls())
             ok = [r for r in results if r.success]
+            failed = [r for r in results if not r.success]
+            error_summary = "; ".join(dict.fromkeys(r.error for r in failed if r.error))[:200] or None
             log_usage({
                 "query": "", "mode": "url-fetch", "urls_searched": 0,
                 "urls_fetched": len(ok),
                 "content_chars": sum(len(r.content) for r in results),
-                "ok": bool(ok), "error": None,
+                "ok": bool(ok), "error": error_summary if not ok else None,
                 "ms": int((time.monotonic() - t0) * 1000), "timeout": False,
                 **_quality_fields(results),
             })
