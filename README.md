@@ -20,11 +20,11 @@ This agent uses DuckDuckGo + Brave to fetch and process 50+ pages per query — 
 
 ## Features
 
-- **Deep Search**: 50+ results via DDG + Brave Search fallback
-- **Anti-Bot Bypass**: Scrapling with TLS fingerprinting (curl-cffi) — passes where httpx gets 403'd
-- **Stealth Retry**: Blocked pages auto-retry via headless browser (Camoufox, max 5 retries)
-- **Smart Extraction**: Trafilatura content-area detection (article body, not nav/sidebar noise)
-- **Token-Efficient Compression**: Sentence-level BM25 + centrality scoring keeps the most relevant and important sentences within budget
+- **Deep Search**: 50+ results via [DuckDuckGo Search](https://github.com/deedy5/duckduckgo_search) + Brave Search fallback
+- **Anti-Bot Bypass**: [Scrapling](https://github.com/D4Vinci/Scrapling) with TLS fingerprinting ([curl-cffi](https://github.com/lexiforest/curl_cffi)) — passes where httpx gets 403'd
+- **Stealth Retry**: Blocked pages auto-retry via headless browser ([Camoufox](https://github.com/daijro/camoufox), max 5 retries)
+- **Smart Extraction**: [Trafilatura](https://github.com/adbar/trafilatura) content-area detection (article body, not nav/sidebar noise)
+- **Token-Efficient Compression**: Sentence-level BM25 ([rank-bm25](https://github.com/dorianbrown/rank_bm25)) + centrality scoring keeps the most relevant and important sentences within budget
 - **Cross-Page Dedup**: Removes duplicate sentences across pages so later results only add new information
 - **Snippet Pre-Filter**: Scores search snippets by query relevance, skips irrelevant URLs before fetching
 - **Observable**: Per-phase timing, failure breakdown, slow URL identification
@@ -32,7 +32,7 @@ This agent uses DuckDuckGo + Brave to fetch and process 50+ pages per query — 
 
 ## Requirements
 
-- **uv**: Auto-installed by wrapper scripts
+- **[uv](https://github.com/astral-sh/uv)**: Auto-installed by wrapper scripts
 - **Python 3.11+**: Auto-installed by uv if needed
 
 ## Brave Search (Optional)
@@ -162,6 +162,18 @@ Before fetching, search result snippets from DDG/Brave are scored by query word 
 
 Automatically filtered (require login or block scraping):
 reddit.com, twitter.com, x.com, facebook.com, youtube.com, tiktok.com, instagram.com, linkedin.com
+
+## Credits
+
+Built on these excellent open-source projects:
+
+- [Scrapling](https://github.com/D4Vinci/Scrapling) — TLS-fingerprinted fetching with anti-bot bypass
+- [Trafilatura](https://github.com/adbar/trafilatura) — Content extraction and boilerplate removal
+- [Camoufox](https://github.com/daijro/camoufox) — Stealth headless browser for blocked pages
+- [curl-cffi](https://github.com/lexiforest/curl_cffi) — TLS fingerprinting (used by Scrapling)
+- [rank-bm25](https://github.com/dorianbrown/rank_bm25) — BM25 scoring for sentence selection
+- [DuckDuckGo Search](https://github.com/deedy5/duckduckgo_search) — Primary search backend
+- [uv](https://github.com/astral-sh/uv) — Python package and dependency management
 
 ## License
 
