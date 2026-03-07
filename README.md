@@ -24,6 +24,9 @@ This agent uses DuckDuckGo + Brave to fetch and process 50+ pages per query — 
 - **Anti-Bot Bypass**: Scrapling with TLS fingerprinting (curl-cffi) — passes where httpx gets 403'd
 - **Stealth Retry**: Blocked pages auto-retry via headless browser (Camoufox, max 5 retries)
 - **Smart Extraction**: Trafilatura content-area detection (article body, not nav/sidebar noise)
+- **Token-Efficient Compression**: Sentence-level BM25 + centrality scoring keeps the most relevant and important sentences within budget
+- **Cross-Page Dedup**: Removes duplicate sentences across pages so later results only add new information
+- **Snippet Pre-Filter**: Scores search snippets by query relevance, skips irrelevant URLs before fetching
 - **Observable**: Per-phase timing, failure breakdown, slow URL identification
 - **Zero Setup**: Auto-installs dependencies via uv
 
