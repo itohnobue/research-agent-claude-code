@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["scrapling[fetchers]", "ddgs"]
+# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura"]
 # ///
 # -*- coding: utf-8 -*-
 """
@@ -104,23 +104,6 @@ BLOCKED_CONTENT_MARKERS: Tuple[str, ...] = (
     "blocked by",
 )
 
-# Navigation text patterns to skip (checked with startswith after lowercasing)
-NAVIGATION_PATTERNS: Tuple[str, ...] = (
-    "skip to", "jump to", "back to ", "< back", "go to ", "get demo",
-    "learn more", "read more", "see more", "view all", "show more",
-    "sign up", "sign in", "log in", "subscribe", "newsletter",
-    "cookie", "accept all", "privacy policy", "terms of",
-    "share this", "share on", "follow us", "connect with",
-    "published by:", "written by:", "posted by:",
-)
-# Lines matching these exactly (case-insensitive) are noise
-_NOISE_EXACT: Set[str] = {
-    "menu", "close", "search", "home", "blog", "about", "contact",
-    "share", "tweet", "pin", "email", "print", "linkedin", "facebook",
-    "twitter", "instagram", "youtube", "tiktok", "reddit", "rss",
-    "table of contents", "contents", "on this page", "in this article",
-}
-
 # Brave Search API key: set BRAVE_API_KEY env var, or place key in ~/.config/brave/api_key
 BRAVE_API_KEY_PATH = Path(os.environ.get("BRAVE_API_KEY_FILE", str(Path.home() / ".config" / "brave" / "api_key")))
 
@@ -152,7 +135,6 @@ RE_MULTI_NEWLINE = re.compile(r"\n{3,}")
 RE_WHITESPACE = re.compile(r"\s+")
 
 # External tool availability (checked once at import)
-W3M_PATH = shutil.which("w3m")
 PDFTOTEXT_PATH = shutil.which("pdftotext")
 
 # =============================================================================
@@ -179,7 +161,7 @@ class ResearchConfig:
     """Configuration for research workflow."""
     query: str
     fetch_count: int = 0
-    max_content_length: int = 5000
+    max_content_length: int = 8000
     timeout: int = 20
     quiet: bool = False
     min_content_length: int = 600
@@ -448,64 +430,30 @@ def is_blocked_content(content: str) -> bool:
     return any(marker in content_lower for marker in BLOCKED_CONTENT_MARKERS)
 
 
-def is_navigation_line(line: str) -> bool:
-    """Check if line is navigation text that should be skipped."""
-    line_lower = line.lower()
-    return any(line_lower.startswith(pattern) for pattern in NAVIGATION_PATTERNS)
 
-
-_RE_BOILERPLATE = re.compile(
-    r"<(script|style|nav|footer|header|aside|noscript|iframe|svg|form)[^>]*>.*?</\1>",
-    re.DOTALL | re.IGNORECASE
-)
-# Common sidebar/menu class patterns
-_RE_NAV_DIVS = re.compile(
-    r'<div[^>]+(?:class|id)\s*=\s*"[^"]*(?:sidebar|sidenav|menu|toc|breadcrumb|nav-|topbar|cookie|banner|popup|modal)[^"]*"[^>]*>.*?</div>',
-    re.DOTALL | re.IGNORECASE
-)
-# Navigation lists: <ul> containing many <li><a> (menu/sidebar pattern)
-_RE_NAV_LISTS = re.compile(
-    r'<ul[^>]*>((?:\s*<li[^>]*>\s*<a[^>]*>.*?</a>\s*</li>\s*){5,})</ul>',
-    re.DOTALL | re.IGNORECASE
-)
-
-
-def _strip_boilerplate(html: str) -> Tuple[str, str]:
-    """Strip boilerplate tags and extract title. Returns (cleaned_html, title)."""
-    # Skip expensive regex on large HTML — patterns with .*? DOTALL can
-    # cause catastrophic backtracking on malformed pages (100% CPU hang).
-    # w3m handles boilerplate fine on its own.
-    if len(html) < 512_000:
-        html = _RE_BOILERPLATE.sub("", html)
-        html = _RE_NAV_DIVS.sub("", html)
-        html = _RE_NAV_LISTS.sub("", html)
-    html = RE_COMMENTS.sub("", html)
-
-    title_match = RE_TITLE.search(html)
-    raw_title = unescape(title_match.group(1).strip()) if title_match else ""
-    title = re.sub(r'\s*[\|\-\u2013\u2014]\s*[^|\-\u2013\u2014]{3,50}$', '', raw_title) if raw_title else ""
-
-    return html, title
-
-
-def _extract_with_w3m(html: str) -> str:
-    """Render HTML to text using w3m."""
-    try:
-        result = subprocess.run(
-            [W3M_PATH, "-dump", "-T", "text/html", "-cols", "120", "-O", "utf-8"],
-            input=html.encode("utf-8", errors="replace"),
-            capture_output=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return result.stdout.decode("utf-8", errors="replace")
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-    return ""
+def _extract_with_trafilatura(html: str) -> str:
+    """Extract article text using trafilatura (content-area detection + boilerplate removal)."""
+    import trafilatura
+    text = trafilatura.extract(
+        html,
+        include_links=True,
+        include_formatting=True,
+        include_tables=True,
+        include_comments=False,
+        output_format="txt",
+    )
+    return text or ""
 
 
 def _extract_with_regex(html: str) -> str:
-    """Fallback: extract text from HTML using regex."""
+    """Fallback: extract text from HTML using regex (for when trafilatura returns nothing)."""
+    # Strip boilerplate tags
+    html = re.compile(
+        r"<(script|style|nav|footer|header|aside|noscript|iframe|svg|form)[^>]*>.*?</\1>",
+        re.DOTALL | re.IGNORECASE,
+    ).sub("", html)
+    html = RE_COMMENTS.sub("", html)
+
     html = RE_BR.sub("\n", html)
     html = RE_BLOCK_END.sub("\n\n", html)
     html = RE_LI.sub("\u2022 ", html)
@@ -518,58 +466,23 @@ def _extract_with_regex(html: str) -> str:
 
 
 def extract_text(html: str) -> str:
-    """Extract readable text from HTML. Uses w3m if available, regex fallback."""
-    cleaned_html, title = _strip_boilerplate(html)
+    """Extract readable text from HTML. Trafilatura primary, regex fallback."""
+    text = _extract_with_trafilatura(html)
 
-    if W3M_PATH:
-        text = _extract_with_w3m(cleaned_html)
-        if not text:
-            text = _extract_with_regex(cleaned_html)
+    if not text or len(text) < 100:
+        text = _extract_with_regex(html)
+
+    # Extract title for prepending
+    title_match = RE_TITLE.search(html)
+    if title_match:
+        raw_title = unescape(title_match.group(1).strip())
+        title = re.sub(r'\s*[\|\-\u2013\u2014]\s*[^|\-\u2013\u2014]{3,50}$', '', raw_title)
     else:
-        text = _extract_with_regex(cleaned_html)
+        title = ""
 
-    # Filter noise from extracted text
-    lines = []
-    prev_line = ""
-    title_lower = title.lower().strip() if title else ""
-
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        if is_navigation_line(line):
-            continue
-        line_lower = line.lower()
-        # Skip exact noise words
-        if line_lower in _NOISE_EXACT:
-            continue
-        # Skip lines that are mostly symbols (nav remnants)
-        alnum_count = sum(1 for c in line if c.isalnum())
-        if len(line) > 3 and alnum_count / len(line) < 0.3:
-            continue
-        if line == prev_line:
-            continue
-        # Skip ALL duplicate title occurrences (not just first)
-        if title_lower and title_lower in line_lower and len(line) < len(title) * 2:
-            continue
-        # Skip hex hashes (image/asset remnants like [681cba6a3f])
-        stripped = line.strip("[]() ")
-        if len(stripped) >= 8 and all(c in "0123456789abcdef" for c in stripped):
-            continue
-        # Skip placeholder tokens
-        if stripped in ("[placeholde]", "[placeholder]", "@"):
-            continue
-        # Skip very short lines that are just a name/handle (author bylines)
-        if len(line) < 3:
-            continue
-        lines.append(line)
-        prev_line = line
-
-    text = "\n".join(lines)
-    text = RE_MULTI_NEWLINE.sub("\n\n", text)
     text = text.strip()
-
-    if title:
+    # Prepend title if not already present
+    if title and not text.startswith(f"# {title}"):
         text = f"# {title}\n\n{text}"
     return text
 
@@ -1258,8 +1171,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Number of search results (default: 20)")
     parser.add_argument("-f", "--fetch", type=int, default=0,
                         help="Max pages to fetch (default: 0 = fetch ALL)")
-    parser.add_argument("-m", "--max-length", type=int, default=4000,
-                        help="Max content length per page (default: 4000)")
+    parser.add_argument("-m", "--max-length", type=int, default=8000,
+                        help="Max content length per page (default: 8000)")
     parser.add_argument("-o", "--output", choices=["json", "raw", "markdown"], default="raw",
                         help="Output format (default: raw)")
     parser.add_argument("-t", "--timeout", type=int, default=5,
