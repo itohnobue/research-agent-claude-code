@@ -73,9 +73,9 @@ logger.propagate = False
 # =============================================================================
 
 BLOCKED_DOMAINS: Tuple[str, ...] = (
-    "reddit.com", "twitter.com", "x.com", "facebook.com",
-    "youtube.com", "tiktok.com", "instagram.com",
-    "linkedin.com",
+    "facebook.com", "tiktok.com", "instagram.com", "linkedin.com", "youtube.com",
+    # twitter.com, x.com: unblocked — FxTwitter API for tweet text
+    # reddit.com: unblocked — Reddit JSON API for posts + comments
     # medium.com: unblocked — full articles extract cleanly
 )
 
@@ -136,6 +136,11 @@ RE_WHITESPACE = re.compile(r"\s+")
 # Sentence boundary: period/exclamation/question + space + uppercase letter
 # Handles common abbreviations by requiring 2+ chars before the period
 RE_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
+# Wikipedia cleanup patterns
+RE_WIKI_CITE = re.compile(r'\[\[?\d+\]?\](?:\(#cite_note[^)]*\))?')  # [[20]](#cite_note-22), [21]
+RE_WIKI_CITE_NAMED = re.compile(r'\[\[?[a-z]\]?\](?:\(#cite_note[^)]*\))?')  # [[b]](#cite_note-b-13)
+RE_WIKI_LINK = re.compile(r'\[([^\]]+)\]\(/wiki/[^)]+\)')  # [Battle](/wiki/Battle) -> Battle
+RE_WIKI_REFLIST = re.compile(r'\n(?:\*\s*)?(?:\[?\d+\]?\s*)?(?:\^.*)?(?:ISBN|ISSN|doi:|JSTOR|S2CID|OCLC).*', re.IGNORECASE)
 # Forum noise: lines that are pure metadata (likes, timestamps, user roles)
 RE_FORUM_NOISE = re.compile(
     r'^\s*(?:'
@@ -451,8 +456,38 @@ def is_blocked_content(content: str) -> bool:
 
 
 
+def _strip_wiki_tables(html: str) -> str:
+    """Remove Wikipedia infobox/navbox tables (may contain nested tables)."""
+    for css_class in ("infobox", "navbox"):
+        pattern = re.compile(
+            rf'<table\b[^>]*class="[^"]*{css_class}[^"]*"[^>]*>',
+            re.IGNORECASE,
+        )
+        while True:
+            m = pattern.search(html)
+            if not m:
+                break
+            # Find matching </table> accounting for nesting
+            depth = 1
+            pos = m.end()
+            while depth > 0 and pos < len(html):
+                next_open = html.find("<table", pos)
+                next_close = html.find("</table>", pos)
+                if next_close == -1:
+                    break
+                if next_open != -1 and next_open < next_close:
+                    depth += 1
+                    pos = next_open + 6
+                else:
+                    depth -= 1
+                    pos = next_close + 8
+            html = html[:m.start()] + html[pos:]
+    return html
+
 def _extract_with_trafilatura(html: str) -> str:
     """Extract article text using trafilatura (content-area detection + boilerplate removal)."""
+    # Strip Wikipedia infobox/navbox tables before extraction (they render as messy pipe-tables)
+    html = _strip_wiki_tables(html)
     import trafilatura
     text = trafilatura.extract(
         html,
@@ -503,6 +538,11 @@ def extract_text(html: str) -> str:
     text = text.strip()
     # Strip forum noise lines (likes, timestamps, user roles)
     text = RE_FORUM_NOISE.sub("", text)
+    # Clean Wikipedia artifacts: citation refs, internal links, reference lists
+    text = RE_WIKI_CITE.sub("", text)
+    text = RE_WIKI_CITE_NAMED.sub("", text)
+    text = RE_WIKI_LINK.sub(r"\1", text)
+    text = RE_WIKI_REFLIST.sub("", text)
     text = RE_MULTI_NEWLINE.sub("\n\n", text)
     # Prepend title if not already present
     if title and not text.startswith(f"# {title}"):
@@ -788,6 +828,185 @@ import atexit
 atexit.register(_shutdown_extract_pool)
 
 
+RE_WIKIPEDIA_URL = re.compile(r'https?://(\w+)\.wikipedia\.org/wiki/(.+?)(?:#.*)?$')
+RE_GITHUB_REPO_URL = re.compile(r'https?://github\.com/([^/]+)/([^/]+?)(?:/?|/tree/[^/]+/?)?$')
+RE_ARXIV_URL = re.compile(r'https?://arxiv\.org/(?:abs|pdf)/(\d+\.\d+)')
+RE_TWITTER_URL = re.compile(r'https?://(?:twitter\.com|x\.com)/([^/]+)/status/(\d+)')
+RE_REDDIT_URL = re.compile(r'https?://(?:www\.)?reddit\.com(/r/[^?#]+)')
+
+def _fetch_wikipedia_api(lang: str, title: str, max_length: int) -> Optional[str]:
+    """Fetch clean text from Wikipedia API (no scraping needed)."""
+    import urllib.request
+    api_url = f"https://{lang}.wikipedia.org/w/api.php?action=query&titles={urllib.parse.quote(title)}&prop=extracts&explaintext=true&format=json"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        pages = data.get("query", {}).get("pages", {})
+        for page_data in pages.values():
+            text = page_data.get("extract", "")
+            if text:
+                page_title = page_data.get("title", title)
+                return f"# {page_title}\n\n{text[:max_length]}"
+    except Exception:
+        pass
+    return None
+
+def _fetch_github_readme(owner: str, repo: str, max_length: int) -> Optional[str]:
+    """Fetch README from GitHub API as rendered HTML, then extract text."""
+    import urllib.request
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/readme"
+    try:
+        req = urllib.request.Request(api_url, headers={
+            "Accept": "application/vnd.github.html+json",
+            "User-Agent": "web-research-tool/1.0",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            html = resp.read().decode()
+        if not html:
+            return None
+        # Use our existing text extraction on the rendered HTML
+        text = _extract_with_regex(html)
+        text = RE_MULTI_NEWLINE.sub("\n\n", text).strip()
+        if text:
+            return f"# {owner}/{repo}\n\n{text[:max_length]}"
+    except Exception:
+        pass
+    return None
+
+def _fetch_arxiv_api(paper_id: str, max_length: int) -> Optional[str]:
+    """Fetch ArXiv paper metadata + abstract via Atom API."""
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    api_url = f"http://export.arxiv.org/api/query?id_list={paper_id}"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            xml_data = resp.read().decode()
+        root = ET.fromstring(xml_data)
+        ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+        entry = root.find("atom:entry", ns)
+        if entry is None:
+            return None
+        title = (entry.findtext("atom:title", "", ns) or "").strip().replace("\n", " ")
+        abstract = (entry.findtext("atom:summary", "", ns) or "").strip()
+        authors = [a.findtext("atom:name", "", ns) for a in entry.findall("atom:author", ns)]
+        published = (entry.findtext("atom:published", "", ns) or "")[:10]
+        categories = [c.get("term", "") for c in entry.findall("atom:category", ns)]
+
+        parts = [f"# {title}\n"]
+        if authors:
+            parts.append(f"Authors: {', '.join(authors[:10])}")
+        if published:
+            parts.append(f"Published: {published}")
+        if categories:
+            parts.append(f"Categories: {', '.join(categories[:5])}")
+        parts.append(f"\n## Abstract\n\n{abstract}")
+
+        text = "\n".join(parts)
+        return text[:max_length] if text else None
+    except Exception:
+        pass
+    return None
+
+def _fetch_twitter_api(screen_name: str, tweet_id: str, max_length: int) -> Optional[str]:
+    """Fetch tweet text via FxTwitter API (no auth required)."""
+    import urllib.request
+    api_url = f"https://api.fxtwitter.com/status/{tweet_id}"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        tweet = data.get("tweet", {})
+        author = tweet.get("author", {})
+        name = author.get("name", screen_name)
+        handle = author.get("screen_name", screen_name)
+        text = tweet.get("text", "")
+        created = tweet.get("created_at", "")
+        likes = tweet.get("likes", 0)
+        retweets = tweet.get("retweets", 0)
+        replies = tweet.get("replies", 0)
+        if not text:
+            return None
+        parts = [f"# @{handle} ({name})\n"]
+        if created:
+            parts.append(f"Date: {created}")
+        parts.append(f"Likes: {likes} | Retweets: {retweets} | Replies: {replies}\n")
+        parts.append(text)
+        quote = tweet.get("quote", {})
+        if quote and quote.get("text"):
+            q_handle = quote.get("author", {}).get("screen_name", "?")
+            parts.append(f"\n> Quoting @{q_handle}:\n> {quote['text']}")
+        result = "\n".join(parts)
+        return result[:max_length]
+    except Exception:
+        pass
+    return None
+
+def _fetch_reddit_json(reddit_path: str, max_length: int) -> Optional[str]:
+    """Fetch Reddit post + comments via Reddit's public JSON API (no auth)."""
+    import urllib.request
+    # Reddit serves JSON when .json is appended to any URL
+    api_url = f"https://www.reddit.com{reddit_path}.json"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0 (research)"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        if not isinstance(data, list) or not data:
+            return None
+        post = data[0]["data"]["children"][0]["data"]
+        title = post.get("title", "")
+        selftext = post.get("selftext", "")
+        score = post.get("score", 0)
+        subreddit = post.get("subreddit", "")
+        author = post.get("author", "")
+        parts = [f"# {title}\n"]
+        parts.append(f"r/{subreddit} | u/{author} | {score} points\n")
+        if selftext:
+            parts.append(selftext)
+        # Extract top comments
+        if len(data) >= 2:
+            comments = data[1]["data"]["children"]
+            for c in comments[:5]:
+                if c.get("kind") != "t1":
+                    continue
+                cd = c["data"]
+                c_score = cd.get("score", 0)
+                c_author = cd.get("author", "")
+                c_body = cd.get("body", "")
+                if c_body:
+                    parts.append(f"\n---\n**u/{c_author}** ({c_score} points):\n{c_body}")
+        text = "\n".join(parts)
+        return text[:max_length] if text else None
+    except Exception:
+        pass
+    return None
+
+def _fetch_wayback_fallback(url: str, max_length: int) -> Optional[str]:
+    """Try Wayback Machine for a recent cached version of the page."""
+    import urllib.request
+    api_url = f"https://archive.org/wayback/available?url={urllib.parse.quote(url, safe='')}"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        snapshot = data.get("archived_snapshots", {}).get("closest", {})
+        if not snapshot.get("available"):
+            return None
+        archive_url = snapshot.get("url", "")
+        if not archive_url:
+            return None
+        req = urllib.request.Request(archive_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode()
+        text = _extract_with_regex(html)
+        text = RE_MULTI_NEWLINE.sub("\n\n", text).strip()
+        if text and len(text) > 200:
+            return text[:max_length]
+    except Exception:
+        pass
+    return None
+
 async def fetch_single_async(
     url: str,
     timeout: int,
@@ -799,6 +1018,53 @@ async def fetch_single_async(
     """Fetch single URL using Scrapling's AsyncFetcher (TLS fingerprinting)."""
     t0 = time.monotonic()
     try:
+        # API fast-path: use native APIs for sites that produce cleaner output than scraping
+        api_content = None
+        loop = asyncio.get_event_loop()
+        wiki_match = RE_WIKIPEDIA_URL.match(url)
+        if wiki_match:
+            lang, title = wiki_match.group(1), wiki_match.group(2)
+            api_content = await loop.run_in_executor(
+                None, _fetch_wikipedia_api, lang, title, max_content_length
+            )
+        gh_match = RE_GITHUB_REPO_URL.match(url) if not api_content else None
+        if gh_match:
+            owner, repo = gh_match.group(1), gh_match.group(2)
+            api_content = await loop.run_in_executor(
+                None, _fetch_github_readme, owner, repo, max_content_length
+            )
+        arxiv_match = RE_ARXIV_URL.match(url) if not api_content else None
+        if arxiv_match:
+            paper_id = arxiv_match.group(1)
+            api_content = await loop.run_in_executor(
+                None, _fetch_arxiv_api, paper_id, max_content_length
+            )
+        tw_match = RE_TWITTER_URL.match(url) if not api_content else None
+        if tw_match:
+            screen_name, tweet_id = tw_match.group(1), tw_match.group(2)
+            api_content = await loop.run_in_executor(
+                None, _fetch_twitter_api, screen_name, tweet_id, max_content_length
+            )
+        reddit_match = RE_REDDIT_URL.match(url) if not api_content else None
+        if reddit_match:
+            reddit_path = reddit_match.group(1)
+            api_content = await loop.run_in_executor(
+                None, _fetch_reddit_json, reddit_path, max_content_length
+            )
+        # For API-routed domains, if API failed, scraping won't help — bail early
+        api_only = tw_match or reddit_match
+        if api_content:
+            elapsed = time.monotonic() - t0
+            result = _create_fetch_result(url, api_content, min_content_length, max_content_length, query=query)
+            if progress:
+                progress.url_result(url, result.success, elapsed, result.error or "")
+            return result
+        if api_only:
+            elapsed = time.monotonic() - t0
+            result = FetchResult(url=url, success=False, error="API extraction failed")
+            if progress:
+                progress.url_result(url, False, elapsed, "API failed")
+            return result
         page = await AsyncFetcher.get(url, timeout=timeout, stealthy_headers=True)
         elapsed = time.monotonic() - t0
 
@@ -850,6 +1116,13 @@ async def fetch_single_async(
             content = structured + content
 
         result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
+        # Wayback Machine fallback for failed/paywalled content
+        if not result.success:
+            wb_content = await loop.run_in_executor(
+                None, _fetch_wayback_fallback, url, max_content_length
+            )
+            if wb_content:
+                result = _create_fetch_result(url, wb_content, min_content_length, max_content_length, query=query)
         if progress:
             progress.url_result(url, result.success, elapsed, result.error or "")
         return result
@@ -1029,11 +1302,15 @@ class MultiSearch:
 
         # Phase 1: DuckDuckGo (primary)
         ddg = DuckDuckGoSearch()
-        for url, title, snippet in ddg.search(query, num_results):
-            if url not in seen_urls:
-                seen_urls.add(url)
-                yield url, title, snippet
-                count += 1
+        try:
+            for url, title, snippet in ddg.search(query, num_results):
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    yield url, title, snippet
+                    count += 1
+        except Exception as e:
+            logger.debug(f"DDG search failed: {e}")
+            print(f"  DDG failed ({type(e).__name__}), trying Brave...", file=sys.stderr)
 
         # Phase 2: Brave (supplement if DDG fell short)
         shortfall = num_results - count
@@ -1113,11 +1390,13 @@ async def run_research_async(
         def search_and_stream():
             nonlocal ddg_count, brave_count, skipped
             enqueued = 0
+            seen_in_search: Set[str] = set()
             for url, title, snippet in searcher.search(config.query, config.search_results):
                 if global_seen_urls is not None:
                     if url in global_seen_urls:
                         continue
                     global_seen_urls.add(url)
+                seen_in_search.add(url)
                 urls.append(url)
                 stats.urls_searched = len(urls)
                 # Snippet relevance gate: skip URLs with zero query word overlap
@@ -1129,21 +1408,70 @@ async def run_research_async(
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
+            # Supplement with DDG video + news results (bonus URLs not in web search)
+            def _enqueue_bonus(url: str) -> None:
+                nonlocal enqueued
+                if url in seen_in_search or not is_valid_url(url) or is_blocked_url(url):
+                    return
+                if global_seen_urls is not None:
+                    if url in global_seen_urls:
+                        return
+                    global_seen_urls.add(url)
+                seen_in_search.add(url)
+                urls.append(url)
+                stats.urls_searched = len(urls)
+                loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
+                enqueued += 1
+
+            # Run bonus searches in parallel (news + reddit)
+            def _bonus_news():
+                try:
+                    ddg = DDGS(verify=False)
+                    for r in ddg.news(config.query, max_results=5):
+                        url = r.get("url", "")
+                        if url:
+                            _enqueue_bonus(url)
+                except Exception:
+                    pass
+
+            def _bonus_reddit():
+                try:
+                    import urllib.request
+                    reddit_q = urllib.parse.quote(config.query)
+                    api_url = f"https://www.reddit.com/search.json?q={reddit_q}&sort=relevance&limit=5"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0 (research)"})
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        data = json.loads(resp.read().decode())
+                    for child in data.get("data", {}).get("children", []):
+                        permalink = child.get("data", {}).get("permalink", "")
+                        if permalink:
+                            _enqueue_bonus(f"https://www.reddit.com{permalink}")
+                except Exception:
+                    pass
+
+            with ThreadPoolExecutor(max_workers=2) as bonus_pool:
+                list(bonus_pool.map(lambda f: f(), [_bonus_news, _bonus_reddit]))
+
             ddg_count = len(urls)
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            await loop.run_in_executor(executor, search_and_stream)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                await loop.run_in_executor(executor, search_and_stream)
 
-        search_elapsed = time.monotonic() - t0
-        source_info = f"{stats.urls_searched} URLs"
-        if searcher._brave_key:
-            source_info += " (DDG+Brave)"
-        else:
-            source_info += " (DDG)"
-        if skipped:
-            source_info += f", {skipped} filtered"
-        progress.message(f"  [search] {source_info} in {search_elapsed:.1f}s")
-        await fetch_queue.put(None)
+            search_elapsed = time.monotonic() - t0
+            source_info = f"{stats.urls_searched} URLs"
+            if searcher._brave_key:
+                source_info += " (DDG+Brave)"
+            else:
+                source_info += " (DDG)"
+            if skipped:
+                source_info += f", {skipped} filtered"
+            progress.message(f"  [search] {source_info} in {search_elapsed:.1f}s")
+        except Exception as e:
+            search_elapsed = time.monotonic() - t0
+            progress.message(f"  [search] failed after {search_elapsed:.1f}s: {e}")
+        finally:
+            await fetch_queue.put(None)
 
     async def fetch_consumer() -> None:
         semaphore = asyncio.Semaphore(config.max_concurrent)
@@ -1331,6 +1659,151 @@ def _dedup_results(
     return deduped, stats
 
 
+def _gemini_summarize(text: str, query: str, progress: Optional['ProgressReporter'] = None) -> str:
+    """Summarize search results via Gemini Flash API. Returns summary or original text on failure."""
+    import urllib.request
+
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        # Try reading from config file
+        key_path = Path.home() / ".config" / "gemini" / "api_key"
+        if key_path.exists():
+            api_key = key_path.read_text().strip()
+    if not api_key:
+        if progress:
+            progress.message("  [summarize] no GEMINI_API_KEY, skipping")
+        return text
+
+    prompt = (
+        "Summarize these web search results for the query: " + json.dumps(query) + "\n"
+        "Keep ALL specific technical details, version numbers, feature names, "
+        "benchmarks, code examples, and URLs of sources. "
+        "Remove fluff, intros, outros, repetition across pages, and promotional content. "
+        "Output a dense, factual summary.\n\n" + text
+    )
+
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 8192, "temperature": 0.1},
+    }).encode()
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        summary = data["candidates"][0]["content"]["parts"][0]["text"]
+        # Strip Gemini's occasional massive whitespace padding in tables
+        summary = re.sub(r' {10,}', ' ', summary)
+        elapsed = time.monotonic() - t0
+        if progress:
+            progress.message(
+                f"  [summarize] {len(text):,} → {len(summary):,} chars "
+                f"({len(text)/len(summary):.1f}x) in {elapsed:.1f}s"
+            )
+        return summary
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        if progress:
+            progress.message(f"  [summarize] failed after {elapsed:.1f}s: {e}")
+        return text
+
+
+def _global_compress(
+    results: List[FetchResult],
+    query: str,
+    budget: int,
+) -> List[FetchResult]:
+    """Cross-page BM25 compression: keep most relevant sentences across all pages within budget.
+    Each page retains its header (title/meta) unconditionally; body sentences compete globally."""
+    from rank_bm25 import BM25Okapi
+
+    total_chars = sum(len(r.content) for r in results if r.success)
+    if total_chars <= budget:
+        return results
+
+    # Parse each page into header + body sentences
+    page_data: List[dict] = []
+    all_sentences: List[Tuple[int, int, str]] = []  # (page_idx, sent_idx, text)
+    for pi, r in enumerate(results):
+        if not r.success:
+            page_data.append({"header": [], "sentences": [], "result": r})
+            continue
+        lines = r.content.split("\n")
+        header: List[str] = []
+        body_lines: List[str] = []
+        in_header = True
+        for line in lines:
+            stripped = line.strip()
+            if in_header and (stripped.startswith("# ") or stripped.startswith("[meta")):
+                header.append(line)
+            else:
+                in_header = False
+                body_lines.append(line)
+        sentences = _split_sentences("\n".join(body_lines))
+        page_data.append({"header": header, "sentences": sentences, "result": r})
+        for si, sent in enumerate(sentences):
+            all_sentences.append((pi, si, sent))
+
+    if not all_sentences:
+        return results
+
+    # BM25 score all sentences globally
+    tokenized = [s.lower().split() for _, _, s in all_sentences]
+    bm25 = BM25Okapi(tokenized)
+    scores = bm25.get_scores(query.lower().split())
+
+    # Rank and select within budget
+    header_budget = sum(
+        sum(len(h) + 1 for h in pd["header"])
+        for pd in page_data
+    )
+    body_budget = budget - header_budget
+
+    ranked = sorted(zip(scores, range(len(all_sentences))), reverse=True)
+    selected: Set[Tuple[int, int]] = set()  # (page_idx, sent_idx)
+    chars_used = 0
+    for score, idx in ranked:
+        if chars_used >= body_budget:
+            break
+        pi, si, sent = all_sentences[idx]
+        selected.add((pi, si))
+        chars_used += len(sent) + 1
+
+    # Rebuild pages with only selected sentences (in original order)
+    compressed: List[FetchResult] = []
+    pages_trimmed = 0
+    for pi, pd in enumerate(page_data):
+        r = pd["result"]
+        if not r.success:
+            compressed.append(r)
+            continue
+        kept = list(pd["header"])
+        page_selected = sorted(si for (p, si) in selected if p == pi)
+        for si in page_selected:
+            kept.append(pd["sentences"][si])
+        new_content = "\n".join(kept).strip()
+        if len(new_content) < 50:
+            pages_trimmed += 1
+            continue
+        if len(new_content) < len(r.content):
+            pages_trimmed += 1
+        compressed.append(FetchResult(
+            url=r.url, success=True, content=new_content,
+            title=r.title, source=r.source,
+        ))
+
+    new_total = sum(len(r.content) for r in compressed if r.success)
+    saved_pct = 100 * (1 - new_total / total_chars)
+    logger.debug(
+        f"Global compress: {total_chars:,} → {new_total:,} chars "
+        f"({saved_pct:.0f}% saved, budget {budget:,}, {pages_trimmed} pages trimmed)"
+    )
+    return compressed
+
+
 # =============================================================================
 # BATCH OUTPUT FORMATTERS (for non-streaming mode)
 # =============================================================================
@@ -1464,8 +1937,14 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Enable verbose logging")
     parser.add_argument("--stream", action="store_true",
                         help="Stream output as results arrive (reduces memory usage)")
+    parser.add_argument("-g", "--global-budget", type=int, default=0,
+                        help="Global char budget across all pages (0 = unlimited)")
     parser.add_argument("--no-stealth", action="store_true",
                         help="Disable stealth browser retry for blocked pages")
+    parser.add_argument("-S", "--summarize", action="store_true", default=True,
+                        help="Summarize results via Gemini Flash (default: on, reduces output ~10x)")
+    parser.add_argument("--no-summarize", action="store_true",
+                        help="Disable Gemini summarization, output raw text")
     parser.add_argument("--usage", action="store_true",
                         help="Show usage statistics (last 30 days)")
     parser.add_argument("--quality", action="store_true",
@@ -1476,6 +1955,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
     if args.usage or args.quality:
         print_usage_stats(quality=args.quality)
         sys.exit(0)
+
+    # --no-summarize overrides -S default
+    if args.no_summarize:
+        args.summarize = False
 
     # JSON output must not have progress messages mixed in (agents parse stdout)
     if args.output == "json":
@@ -1591,12 +2074,18 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 })
                 if results:
                     results, dedup_st = _dedup_results(results)
+                    if args.global_budget > 0:
+                        results = _global_compress(results, config.query, args.global_budget)
                     if args.output == "json":
                         print(format_batch_json(results, config.query))
                     elif args.output == "markdown":
                         print(format_batch_markdown(results, config.query, config.max_content_length))
                     else:
-                        print(format_batch_raw(results))
+                        raw = format_batch_raw(results)
+                        if args.summarize:
+                            progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
+                            raw = _gemini_summarize(raw, config.query, progress)
+                        print(raw)
                 else:
                     print("No results found", file=sys.stderr)
                     sys.exit(1)
@@ -1653,6 +2142,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 if not results:
                     continue
                 results, _ = _dedup_results(results, seen=dedup_seen, seen_fuzzy=dedup_fuzzy)
+                if args.global_budget > 0:
+                    results = _global_compress(results, query, args.global_budget)
                 if args.output == "json":
                     print(format_batch_json(results, query))
                 elif args.output == "markdown":
@@ -1662,7 +2153,11 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         print(f"\n{'='*60}")
                         print(f"QUERY: {query}")
                         print(f"{'='*60}\n")
-                    print(format_batch_raw(results))
+                    raw = format_batch_raw(results)
+                    if args.summarize:
+                        progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
+                        raw = _gemini_summarize(raw, query, progress)
+                    print(raw)
 
     except KeyboardInterrupt:
         print("\nInterrupted", file=sys.stderr)
