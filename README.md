@@ -26,6 +26,7 @@ This agent uses DuckDuckGo + Brave to fetch and process 50+ pages per query — 
 - **Smart Extraction**: [Trafilatura](https://github.com/adbar/trafilatura) content-area detection (article body, not nav/sidebar noise)
 - **Token-Efficient Compression**: Sentence-level BM25 ([rank-bm25](https://github.com/dorianbrown/rank_bm25)) + centrality scoring keeps the most relevant and important sentences within budget
 - **Cross-Page Dedup**: Removes duplicate sentences across pages so later results only add new information
+- **Bonus Sources**: Supplements web results with DDG News + Reddit discussions (searched in parallel)
 - **Snippet Pre-Filter**: Scores search snippets by query relevance, skips irrelevant URLs before fetching
 - **Observable**: Per-phase timing, failure breakdown, slow URL identification
 - **Zero Setup**: Auto-installs dependencies via uv
@@ -163,7 +164,7 @@ Before fetching, search result snippets from DDG/Brave are scored by query word 
 ## Blocked Domains
 
 Automatically filtered (no usable text content):
-facebook.com, tiktok.com, instagram.com, linkedin.com
+facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.com
 
 ## API-Routed Domains
 
@@ -171,9 +172,8 @@ These previously-blocked domains now return clean content via API extraction:
 
 | Domain | Method | Content |
 |---|---|---|
-| youtube.com | [`youtube-transcript-api`](https://github.com/jdepoix/youtube-transcript-api) | Video transcript (auto-captions) |
 | twitter.com, x.com | [FxTwitter](https://github.com/FixTweet/FxTwitter) API | Tweet text, author, metrics |
-| reddit.com | Reddit JSON API | Post + top comments |
+| reddit.com | [Reddit JSON](https://www.reddit.com/dev/api/) API | Post + top comments |
 | en.wikipedia.org | [MediaWiki](https://www.mediawiki.org/wiki/API:Main_page) API | Article text (no citation noise) |
 | github.com | [GitHub REST](https://docs.github.com/en/rest) API | README rendered to text |
 | arxiv.org | [ArXiv Atom](https://info.arxiv.org/help/api/index.html) API | Paper metadata + abstract |

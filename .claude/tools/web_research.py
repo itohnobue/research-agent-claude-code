@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25", "youtube-transcript-api"]
+# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25"]
 # ///
 # -*- coding: utf-8 -*-
 """
@@ -73,10 +73,9 @@ logger.propagate = False
 # =============================================================================
 
 BLOCKED_DOMAINS: Tuple[str, ...] = (
-    "facebook.com", "tiktok.com", "instagram.com", "linkedin.com",
-    # youtube.com: unblocked — transcript extraction via youtube-transcript-api
+    "facebook.com", "tiktok.com", "instagram.com", "linkedin.com", "youtube.com",
     # twitter.com, x.com: unblocked — FxTwitter API for tweet text
-    # reddit.com: unblocked — Redlib instances for clean HTML
+    # reddit.com: unblocked — Reddit JSON API for posts + comments
     # medium.com: unblocked — full articles extract cleanly
 )
 
@@ -832,7 +831,6 @@ atexit.register(_shutdown_extract_pool)
 RE_WIKIPEDIA_URL = re.compile(r'https?://(\w+)\.wikipedia\.org/wiki/(.+?)(?:#.*)?$')
 RE_GITHUB_REPO_URL = re.compile(r'https?://github\.com/([^/]+)/([^/]+?)(?:/?|/tree/[^/]+/?)?$')
 RE_ARXIV_URL = re.compile(r'https?://arxiv\.org/(?:abs|pdf)/(\d+\.\d+)')
-RE_YOUTUBE_URL = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]{11})')
 RE_TWITTER_URL = re.compile(r'https?://(?:twitter\.com|x\.com)/([^/]+)/status/(\d+)')
 RE_REDDIT_URL = re.compile(r'https?://(?:www\.)?reddit\.com(/r/[^?#]+)')
 
@@ -907,37 +905,6 @@ def _fetch_arxiv_api(paper_id: str, max_length: int) -> Optional[str]:
 
         text = "\n".join(parts)
         return text[:max_length] if text else None
-    except Exception:
-        pass
-    return None
-
-def _fetch_youtube_transcript(video_id: str, max_length: int) -> Optional[str]:
-    """Fetch YouTube video transcript via youtube-transcript-api."""
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-        from youtube_transcript_api.formatters import TextFormatter
-    except ImportError:
-        return None
-    try:
-        ytt = YouTubeTranscriptApi()
-        transcript = ytt.fetch(video_id)
-        text = TextFormatter().format_transcript(transcript)
-        if not text:
-            return None
-        # Try to get video title via yt-dlp if available
-        title = f"YouTube Video {video_id}"
-        try:
-            import subprocess
-            r = subprocess.run(
-                ["yt-dlp", "--print", "title", "--no-download", f"https://youtu.be/{video_id}"],
-                capture_output=True, text=True, timeout=5
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                title = r.stdout.strip()
-        except Exception:
-            pass
-        header = f"# {title}\n\n"
-        return (header + text)[:max_length]
     except Exception:
         pass
     return None
@@ -1072,12 +1039,6 @@ async def fetch_single_async(
             api_content = await loop.run_in_executor(
                 None, _fetch_arxiv_api, paper_id, max_content_length
             )
-        yt_match = RE_YOUTUBE_URL.search(url) if not api_content else None
-        if yt_match:
-            video_id = yt_match.group(1)
-            api_content = await loop.run_in_executor(
-                None, _fetch_youtube_transcript, video_id, max_content_length
-            )
         tw_match = RE_TWITTER_URL.match(url) if not api_content else None
         if tw_match:
             screen_name, tweet_id = tw_match.group(1), tw_match.group(2)
@@ -1091,7 +1052,7 @@ async def fetch_single_async(
                 None, _fetch_reddit_json, reddit_path, max_content_length
             )
         # For API-routed domains, if API failed, scraping won't help — bail early
-        api_only = yt_match or tw_match or reddit_match
+        api_only = tw_match or reddit_match
         if api_content:
             elapsed = time.monotonic() - t0
             result = _create_fetch_result(url, api_content, min_content_length, max_content_length, query=query)
@@ -1462,38 +1423,34 @@ async def run_research_async(
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
-            try:
-                ddg = DDGS(verify=False)
-                for r in ddg.videos(config.query, max_results=5):
-                    url = r.get("content", r.get("embed_url", ""))
-                    if url:
-                        _enqueue_bonus(url)
-            except Exception:
-                pass
+            # Run bonus searches in parallel (news + reddit)
+            def _bonus_news():
+                try:
+                    ddg = DDGS(verify=False)
+                    for r in ddg.news(config.query, max_results=5):
+                        url = r.get("url", "")
+                        if url:
+                            _enqueue_bonus(url)
+                except Exception:
+                    pass
 
-            try:
-                ddg = DDGS(verify=False)
-                for r in ddg.news(config.query, max_results=5):
-                    url = r.get("url", "")
-                    if url:
-                        _enqueue_bonus(url)
-            except Exception:
-                pass
+            def _bonus_reddit():
+                try:
+                    import urllib.request
+                    reddit_q = urllib.parse.quote(config.query)
+                    api_url = f"https://www.reddit.com/search.json?q={reddit_q}&sort=relevance&limit=5"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0 (research)"})
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        data = json.loads(resp.read().decode())
+                    for child in data.get("data", {}).get("children", []):
+                        permalink = child.get("data", {}).get("permalink", "")
+                        if permalink:
+                            _enqueue_bonus(f"https://www.reddit.com{permalink}")
+                except Exception:
+                    pass
 
-            # Reddit discussions via Reddit search API
-            try:
-                import urllib.request
-                reddit_q = urllib.parse.quote(config.query)
-                api_url = f"https://www.reddit.com/search.json?q={reddit_q}&sort=relevance&limit=5"
-                req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0 (research)"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = json.loads(resp.read().decode())
-                for child in data.get("data", {}).get("children", []):
-                    permalink = child.get("data", {}).get("permalink", "")
-                    if permalink:
-                        _enqueue_bonus(f"https://www.reddit.com{permalink}")
-            except Exception:
-                pass
+            with ThreadPoolExecutor(max_workers=2) as bonus_pool:
+                list(bonus_pool.map(lambda f: f(), [_bonus_news, _bonus_reddit]))
 
             ddg_count = len(urls)
 
