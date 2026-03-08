@@ -162,8 +162,23 @@ Before fetching, search result snippets from DDG/Brave are scored by query word 
 
 ## Blocked Domains
 
-Automatically filtered (require login or block scraping):
-reddit.com, twitter.com, x.com, facebook.com, youtube.com, tiktok.com, instagram.com, linkedin.com
+Automatically filtered (no usable text content):
+facebook.com, tiktok.com, instagram.com, linkedin.com
+
+## API-Routed Domains
+
+These previously-blocked domains now return clean content via API extraction:
+
+| Domain | Method | Content |
+|---|---|---|
+| youtube.com | [`youtube-transcript-api`](https://github.com/jdepoix/youtube-transcript-api) | Video transcript (auto-captions) |
+| twitter.com, x.com | [FxTwitter](https://github.com/FixTweet/FxTwitter) API | Tweet text, author, metrics |
+| reddit.com | Reddit JSON API | Post + top comments |
+| en.wikipedia.org | [MediaWiki](https://www.mediawiki.org/wiki/API:Main_page) API | Article text (no citation noise) |
+| github.com | [GitHub REST](https://docs.github.com/en/rest) API | README rendered to text |
+| arxiv.org | [ArXiv Atom](https://info.arxiv.org/help/api/index.html) API | Paper metadata + abstract |
+
+Paywalled pages automatically fall back to [Wayback Machine](https://web.archive.org/) cached versions.
 
 ## Credits
 
