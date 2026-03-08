@@ -829,6 +829,8 @@ atexit.register(_shutdown_extract_pool)
 
 
 RE_WIKIPEDIA_URL = re.compile(r'https?://(\w+)\.wikipedia\.org/wiki/(.+?)(?:#.*)?$')
+RE_GITHUB_REPO_URL = re.compile(r'https?://github\.com/([^/]+)/([^/]+?)(?:/?|/tree/[^/]+/?)?$')
+RE_STACKOVERFLOW_URL = re.compile(r'https?://stackoverflow\.com/questions/(\d+)')
 
 def _fetch_wikipedia_api(lang: str, title: str, max_length: int) -> Optional[str]:
     """Fetch clean text from Wikipedia API (no scraping needed)."""
@@ -848,6 +850,76 @@ def _fetch_wikipedia_api(lang: str, title: str, max_length: int) -> Optional[str
         pass
     return None
 
+def _fetch_github_readme(owner: str, repo: str, max_length: int) -> Optional[str]:
+    """Fetch README from GitHub API as rendered HTML, then extract text."""
+    import urllib.request
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/readme"
+    try:
+        req = urllib.request.Request(api_url, headers={
+            "Accept": "application/vnd.github.html+json",
+            "User-Agent": "web-research-tool/1.0",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            html = resp.read().decode()
+        if not html:
+            return None
+        # Use our existing text extraction on the rendered HTML
+        text = _extract_with_regex(html)
+        text = RE_MULTI_NEWLINE.sub("\n\n", text).strip()
+        if text:
+            return f"# {owner}/{repo}\n\n{text[:max_length]}"
+    except Exception:
+        pass
+    return None
+
+def _fetch_stackoverflow_api(question_id: str, max_length: int) -> Optional[str]:
+    """Fetch question + top answers from Stack Exchange API (clean markdown)."""
+    import urllib.request
+    import gzip
+    api_url = f"https://api.stackexchange.com/2.3/questions/{question_id}?order=desc&sort=activity&site=stackoverflow&filter=withbody"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read()
+            # SE API always gzips responses
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+            data = json.loads(raw.decode())
+        items = data.get("items", [])
+        if not items:
+            return None
+        q = items[0]
+        title = q.get("title", "")
+        q_body = q.get("body", "")
+        # Strip HTML tags from body and unescape entities (SE API returns HTML)
+        q_body = unescape(re.sub(r'<[^>]+>', '', q_body)).strip()
+
+        parts = [f"# {title}\n\n{q_body}"]
+
+        # Fetch top answers
+        ans_url = f"https://api.stackexchange.com/2.3/questions/{question_id}/answers?order=desc&sort=votes&site=stackoverflow&filter=withbody&pagesize=3"
+        req = urllib.request.Request(ans_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read()
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+            ans_data = json.loads(raw.decode())
+        for i, ans in enumerate(ans_data.get("items", [])[:3], 1):
+            score = ans.get("score", 0)
+            body = unescape(re.sub(r'<[^>]+>', '', ans.get("body", ""))).strip()
+            accepted = " ✓" if ans.get("is_accepted") else ""
+            parts.append(f"\n## Answer {i} (score: {score}{accepted})\n\n{body}")
+
+        text = "\n".join(parts)
+        return text[:max_length] if text else None
+    except Exception:
+        pass
+    return None
+
 async def fetch_single_async(
     url: str,
     timeout: int,
@@ -859,19 +931,33 @@ async def fetch_single_async(
     """Fetch single URL using Scrapling's AsyncFetcher (TLS fingerprinting)."""
     t0 = time.monotonic()
     try:
-        # Wikipedia: use API for clean text instead of scraping
+        # API fast-path: use native APIs for sites that produce cleaner output than scraping
+        api_content = None
         wiki_match = RE_WIKIPEDIA_URL.match(url)
+        gh_match = RE_GITHUB_REPO_URL.match(url) if not wiki_match else None
+        so_match = RE_STACKOVERFLOW_URL.match(url) if not wiki_match and not gh_match else None
+        loop = asyncio.get_event_loop()
         if wiki_match:
             lang, title = wiki_match.group(1), wiki_match.group(2)
-            content = await asyncio.get_event_loop().run_in_executor(
+            api_content = await loop.run_in_executor(
                 None, _fetch_wikipedia_api, lang, title, max_content_length
             )
-            if content:
-                elapsed = time.monotonic() - t0
-                result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
-                if progress:
-                    progress.url_result(url, result.success, elapsed, result.error or "")
-                return result
+        elif gh_match:
+            owner, repo = gh_match.group(1), gh_match.group(2)
+            api_content = await loop.run_in_executor(
+                None, _fetch_github_readme, owner, repo, max_content_length
+            )
+        elif so_match:
+            question_id = so_match.group(1)
+            api_content = await loop.run_in_executor(
+                None, _fetch_stackoverflow_api, question_id, max_content_length
+            )
+        if api_content:
+            elapsed = time.monotonic() - t0
+            result = _create_fetch_result(url, api_content, min_content_length, max_content_length, query=query)
+            if progress:
+                progress.url_result(url, result.success, elapsed, result.error or "")
+            return result
         page = await AsyncFetcher.get(url, timeout=timeout, stealthy_headers=True)
         elapsed = time.monotonic() - t0
 
