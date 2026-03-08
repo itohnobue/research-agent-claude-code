@@ -1659,6 +1659,99 @@ def _dedup_results(
     return deduped, stats
 
 
+def _global_compress(
+    results: List[FetchResult],
+    query: str,
+    budget: int,
+) -> List[FetchResult]:
+    """Cross-page BM25 compression: keep most relevant sentences across all pages within budget.
+    Each page retains its header (title/meta) unconditionally; body sentences compete globally."""
+    from rank_bm25 import BM25Okapi
+
+    total_chars = sum(len(r.content) for r in results if r.success)
+    if total_chars <= budget:
+        return results
+
+    # Parse each page into header + body sentences
+    page_data: List[dict] = []
+    all_sentences: List[Tuple[int, int, str]] = []  # (page_idx, sent_idx, text)
+    for pi, r in enumerate(results):
+        if not r.success:
+            page_data.append({"header": [], "sentences": [], "result": r})
+            continue
+        lines = r.content.split("\n")
+        header: List[str] = []
+        body_lines: List[str] = []
+        in_header = True
+        for line in lines:
+            stripped = line.strip()
+            if in_header and (stripped.startswith("# ") or stripped.startswith("[meta")):
+                header.append(line)
+            else:
+                in_header = False
+                body_lines.append(line)
+        sentences = _split_sentences("\n".join(body_lines))
+        page_data.append({"header": header, "sentences": sentences, "result": r})
+        for si, sent in enumerate(sentences):
+            all_sentences.append((pi, si, sent))
+
+    if not all_sentences:
+        return results
+
+    # BM25 score all sentences globally
+    tokenized = [s.lower().split() for _, _, s in all_sentences]
+    bm25 = BM25Okapi(tokenized)
+    scores = bm25.get_scores(query.lower().split())
+
+    # Rank and select within budget
+    header_budget = sum(
+        sum(len(h) + 1 for h in pd["header"])
+        for pd in page_data
+    )
+    body_budget = budget - header_budget
+
+    ranked = sorted(zip(scores, range(len(all_sentences))), reverse=True)
+    selected: Set[Tuple[int, int]] = set()  # (page_idx, sent_idx)
+    chars_used = 0
+    for score, idx in ranked:
+        if chars_used >= body_budget:
+            break
+        pi, si, sent = all_sentences[idx]
+        selected.add((pi, si))
+        chars_used += len(sent) + 1
+
+    # Rebuild pages with only selected sentences (in original order)
+    compressed: List[FetchResult] = []
+    pages_trimmed = 0
+    for pi, pd in enumerate(page_data):
+        r = pd["result"]
+        if not r.success:
+            compressed.append(r)
+            continue
+        kept = list(pd["header"])
+        page_selected = sorted(si for (p, si) in selected if p == pi)
+        for si in page_selected:
+            kept.append(pd["sentences"][si])
+        new_content = "\n".join(kept).strip()
+        if len(new_content) < 50:
+            pages_trimmed += 1
+            continue
+        if len(new_content) < len(r.content):
+            pages_trimmed += 1
+        compressed.append(FetchResult(
+            url=r.url, success=True, content=new_content,
+            title=r.title, source=r.source,
+        ))
+
+    new_total = sum(len(r.content) for r in compressed if r.success)
+    saved_pct = 100 * (1 - new_total / total_chars)
+    logger.debug(
+        f"Global compress: {total_chars:,} → {new_total:,} chars "
+        f"({saved_pct:.0f}% saved, budget {budget:,}, {pages_trimmed} pages trimmed)"
+    )
+    return compressed
+
+
 # =============================================================================
 # BATCH OUTPUT FORMATTERS (for non-streaming mode)
 # =============================================================================
@@ -1792,6 +1885,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Enable verbose logging")
     parser.add_argument("--stream", action="store_true",
                         help="Stream output as results arrive (reduces memory usage)")
+    parser.add_argument("-g", "--global-budget", type=int, default=0,
+                        help="Global char budget across all pages (0 = unlimited)")
     parser.add_argument("--no-stealth", action="store_true",
                         help="Disable stealth browser retry for blocked pages")
     parser.add_argument("--usage", action="store_true",
@@ -1918,6 +2013,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 })
                 if results:
                     results, dedup_st = _dedup_results(results)
+                    if args.global_budget > 0:
+                        results = _global_compress(results, config.query, args.global_budget)
                     if args.output == "json":
                         print(format_batch_json(results, config.query))
                     elif args.output == "markdown":
@@ -1980,6 +2077,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 if not results:
                     continue
                 results, _ = _dedup_results(results, seen=dedup_seen, seen_fuzzy=dedup_fuzzy)
+                if args.global_budget > 0:
+                    results = _global_compress(results, query, args.global_budget)
                 if args.output == "json":
                     print(format_batch_json(results, query))
                 elif args.output == "markdown":

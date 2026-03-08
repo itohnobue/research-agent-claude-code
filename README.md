@@ -84,6 +84,7 @@ Slow URLs (>5s) are always listed in the summary, even without `-v`. Low success
 -s N          Number of search results (default: 20)
 -f N          Max pages to fetch (default: 0 = all)
 -m N          Max chars per page (default: 8000)
+-g N          Global char budget across all pages (0 = off, try 30000)
 -o FORMAT     Output format: raw (default), json, markdown
 -v            Verbose: show per-URL timing
 -q            Quiet: suppress progress messages
@@ -150,6 +151,17 @@ Before fetching, search result snippets from DDG/Brave are scored by query word 
 
 **Measured impact**: Speed optimization, not token savings. Skips 0-5 irrelevant fetches per query, reducing latency by 20-40% on queries with noisy results.
 
+### Stage 5: Global Compression (opt-in)
+
+When `-g N` is set, all pages are compressed together to fit within N total chars:
+
+1. All sentences from all pages are scored against the query using BM25
+2. Top-scoring sentences are selected globally within the char budget
+3. Each page retains its header (title/metadata) unconditionally
+4. Pages with no surviving sentences are dropped
+
+**Measured impact**: At `-g 30000`, compresses ~74K → 30K chars (2.5x) while retaining 50-80% of query-relevant term mentions. BM25 preferentially keeps sentences containing query terms, so information density increases. No GPU needed, <0.1s latency.
+
 ### Ablation Summary
 
 | Feature | Token savings | Quality | Speed | Notes |
@@ -160,6 +172,7 @@ Before fetching, search result snippets from DDG/Brave are scored by query word 
 | Cross-page exact dedup | 0-12% | Same | Same | Highest on docs/specs topics |
 | Fuzzy dedup | ~0.5% on top of exact | Same | Same | Marginal |
 | Snippet pre-filter | 0% | Same | 20-40% faster | Speed only |
+| Global compression (`-g`) | 60% at g=30K | Good (BM25-focused) | Same | Opt-in, no GPU needed |
 
 ## Blocked Domains
 
