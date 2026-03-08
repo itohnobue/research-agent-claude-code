@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25"]
+# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25", "youtube-transcript-api"]
 # ///
 # -*- coding: utf-8 -*-
 """
@@ -73,9 +73,10 @@ logger.propagate = False
 # =============================================================================
 
 BLOCKED_DOMAINS: Tuple[str, ...] = (
-    "reddit.com", "twitter.com", "x.com", "facebook.com",
-    "youtube.com", "tiktok.com", "instagram.com",
-    "linkedin.com",
+    "facebook.com", "tiktok.com", "instagram.com", "linkedin.com",
+    # youtube.com: unblocked — transcript extraction via youtube-transcript-api
+    # twitter.com, x.com: unblocked — FxTwitter API for tweet text
+    # reddit.com: unblocked — Redlib instances for clean HTML
     # medium.com: unblocked — full articles extract cleanly
 )
 
