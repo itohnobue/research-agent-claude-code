@@ -1214,12 +1214,29 @@ def _load_brave_api_key() -> Optional[str]:
         return None
 
 
+_STOPWORDS = frozenset(
+    "a an the and or but in on at to for of is it by with from as be was were "
+    "are been has have had do does did will would can could should may might "
+    "this that these those how what when where which who whom why not no nor "
+    "so if then than too very just about also into over after before between "
+    "new best top most latest current using used use get like".split()
+)
+
 def _snippet_relevance(query: str, title: str, snippet: str) -> float:
-    """Score snippet relevance to query by word overlap. Returns 0.0-1.0."""
-    query_words = set(query.lower().split())
-    text_words = set((title + " " + snippet).lower().split())
+    """Score snippet relevance to query by content word overlap. Returns 0.0-1.0.
+
+    Filters out stopwords and short/numeric tokens so common words like
+    'AI', '2025', 'new', 'best' don't inflate relevance scores.
+    """
+    raw_words = set(query.lower().split())
+    # Keep only content words: not a stopword, not purely numeric, length > 2
+    query_words = {w for w in raw_words if w not in _STOPWORDS and not w.isdigit() and len(w) > 2}
+    if not query_words:
+        # All query words are stopwords/short — fall back to raw overlap
+        query_words = raw_words
     if not query_words:
         return 1.0
+    text_words = set((title + " " + snippet).lower().split())
     return len(query_words & text_words) / len(query_words)
 
 
@@ -1399,12 +1416,18 @@ async def run_research_async(
                 seen_in_search.add(url)
                 urls.append(url)
                 stats.urls_searched = len(urls)
-                # Snippet relevance gate: skip URLs with zero query word overlap
+                # Snippet relevance gate: require meaningful query word overlap
+                # For long queries (4+ words), require at least 2 matching words
+                # to filter junk that only matches common words like "AI" or "2025"
                 # Always enqueue at least 5 URLs (safety net for edge cases)
-                relevance = _snippet_relevance(config.query, title, snippet)
-                if relevance == 0 and enqueued >= 5:
-                    skipped += 1
-                    continue
+                if enqueued >= 5:
+                    query_words = set(config.query.lower().split())
+                    text_words = set((title + " " + snippet).lower().split())
+                    overlap = len(query_words & text_words)
+                    min_overlap = 2 if len(query_words) >= 4 else 1
+                    if overlap < min_overlap:
+                        skipped += 1
+                        continue
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
@@ -1423,13 +1446,20 @@ async def run_research_async(
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
+            # Relevance gate for bonus results — require 2+ query word overlap
+            # to prevent "AI" or "2025" alone from pulling in random Reddit/news
+            def _bonus_relevant(title: str, body: str = "") -> bool:
+                query_words = set(config.query.lower().split())
+                text_words = set((title + " " + body).lower().split())
+                return len(query_words & text_words) >= min(2, len(query_words))
+
             # Run bonus searches in parallel (news + reddit)
             def _bonus_news():
                 try:
                     ddg = DDGS(verify=False)
                     for r in ddg.news(config.query, max_results=5):
                         url = r.get("url", "")
-                        if url:
+                        if url and _bonus_relevant(r.get("title", ""), r.get("body", "")):
                             _enqueue_bonus(url)
                 except Exception:
                     pass
@@ -1443,8 +1473,10 @@ async def run_research_async(
                     with urllib.request.urlopen(req, timeout=5) as resp:
                         data = json.loads(resp.read().decode())
                     for child in data.get("data", {}).get("children", []):
-                        permalink = child.get("data", {}).get("permalink", "")
-                        if permalink:
+                        d = child.get("data", {})
+                        permalink = d.get("permalink", "")
+                        title = d.get("title", "")
+                        if permalink and _bonus_relevant(title, d.get("selftext", "")[:200]):
                             _enqueue_bonus(f"https://www.reddit.com{permalink}")
                 except Exception:
                     pass
@@ -1676,9 +1708,12 @@ def _gemini_summarize(text: str, query: str, progress: Optional['ProgressReporte
 
     prompt = (
         "Summarize these web search results for the query: " + json.dumps(query) + "\n"
+        "IMPORTANT: Completely omit any results that are not relevant to the query. "
+        "Do not include tangentially related content just because it shares a keyword. "
         "Keep ALL specific technical details, version numbers, feature names, "
-        "benchmarks, code examples, and URLs of sources. "
+        "benchmarks, code examples, and URLs of sources that are relevant to the query. "
         "Remove fluff, intros, outros, repetition across pages, and promotional content. "
+        "Use bullet points, not markdown tables. "
         "Output a dense, factual summary.\n\n" + text
     )
 
@@ -1695,8 +1730,9 @@ def _gemini_summarize(text: str, query: str, progress: Optional['ProgressReporte
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
         summary = data["candidates"][0]["content"]["parts"][0]["text"]
-        # Strip Gemini's occasional massive whitespace padding in tables
+        # Strip Gemini's occasional massive whitespace/dash padding in tables
         summary = re.sub(r' {10,}', ' ', summary)
+        summary = re.sub(r'-{20,}', '---', summary)
         elapsed = time.monotonic() - t0
         if progress:
             progress.message(
@@ -1945,6 +1981,14 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Summarize results via Gemini Flash (default: on, reduces output ~10x)")
     parser.add_argument("--no-summarize", action="store_true",
                         help="Disable Gemini summarization, output raw text")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Skip cache lookup and write")
+    parser.add_argument("--cache-only", action="store_true",
+                        help="Only return cached results, no web fetch")
+    parser.add_argument("--cache-stats", action="store_true",
+                        help="Print cache statistics and exit")
+    parser.add_argument("--max-age", type=int, default=168,
+                        help="Max cache age in hours (default: 168 = 7 days)")
     parser.add_argument("--usage", action="store_true",
                         help="Show usage statistics (last 30 days)")
     parser.add_argument("--quality", action="store_true",
@@ -1954,6 +1998,14 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
 
     if args.usage or args.quality:
         print_usage_stats(quality=args.quality)
+        sys.exit(0)
+
+    if args.cache_stats:
+        _tools_dir = os.path.dirname(os.path.abspath(__file__))
+        if _tools_dir not in sys.path:
+            sys.path.insert(0, _tools_dir)
+        from search_cache import SearchCache
+        SearchCache().print_stats()
         sys.exit(0)
 
     # --no-summarize overrides -S default
@@ -2047,11 +2099,70 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         signal.signal(signal.SIGALRM, _timeout_handler)
         signal.alarm(_WALL_TIMEOUT)
 
+    # Initialize cache (unless disabled)
+    cache = None
+    if not args.no_cache:
+        try:
+            _tools_dir = os.path.dirname(os.path.abspath(__file__))
+            if _tools_dir not in sys.path:
+                sys.path.insert(0, _tools_dir)
+            from search_cache import SearchCache
+            cache = SearchCache()
+        except Exception as e:
+            logger.debug(f"Cache unavailable: {e}")
+
+    def _cache_write_results(results: List[FetchResult], query: str) -> None:
+        """Write successful fetch results to cache (best-effort)."""
+        if not cache:
+            return
+        for r in results:
+            if r.success and r.content:
+                try:
+                    domain = urllib.parse.urlparse(r.url).netloc
+                    cache.store(r.url, domain, r.title, r.content, query)
+                except Exception:
+                    pass
+
+    def _cache_hits_to_results(query: str) -> Optional[List[FetchResult]]:
+        """Check cache for hits. Returns FetchResult list or None."""
+        if not cache:
+            return None
+        try:
+            hits = cache.lookup(query, max_age_hours=args.max_age)
+            if hits:
+                progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
+                progress.message(f"  [cache] {len(hits)} cached results (best sim={hits[0].similarity:.2f}, authority={hits[0].authority:.1f})")
+                return [
+                    FetchResult(url=h.url, success=True, content=h.content, title=h.title, source="cache")
+                    for h in hits
+                ]
+        except Exception as e:
+            logger.debug(f"Cache lookup failed: {e}")
+        return None
+
     try:
         if len(queries) == 1:
-            # Single query: original behavior
+            # Single query: check cache first, then web search
             config = make_config(queries[0])
             t0 = time.monotonic()
+
+            # Cache-only mode
+            if args.cache_only:
+                cached = _cache_hits_to_results(config.query)
+                if cached:
+                    if args.output == "json":
+                        print(format_batch_json(cached, config.query))
+                    else:
+                        raw = format_batch_raw(cached)
+                        if args.summarize:
+                            progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
+                            raw = _gemini_summarize(raw, config.query, progress)
+                        print(raw)
+                else:
+                    print("No cached results found", file=sys.stderr)
+                    sys.exit(1)
+                sys.exit(0)
+
             if args.stream:
                 run_research(config, verbose=args.verbose)
                 log_usage({
@@ -2064,6 +2175,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             else:
                 results = run_research(config, verbose=args.verbose)
                 ok = [r for r in (results or []) if r.success]
+
+                # Write results to cache
+                _cache_write_results(ok, config.query)
+
                 log_usage({
                     "query": config.query, "mode": "search",
                     "urls_fetched": len(ok),
@@ -2131,6 +2246,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             dedup_fuzzy: Set[str] = set()
             for query, results in all_results:
                 ok = [r for r in results if r.success]
+                _cache_write_results(ok, query)
                 log_usage({
                     "query": query, "mode": "multi",
                     "urls_fetched": len(ok),
