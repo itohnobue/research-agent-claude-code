@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25"]
+# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25", "httpx"]
 # ///
 # -*- coding: utf-8 -*-
 """
@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import time
+import types
 import urllib.parse
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -73,6 +74,11 @@ logger.propagate = False
 
 BLOCKED_DOMAINS: Tuple[str, ...] = (
     "facebook.com", "tiktok.com", "instagram.com", "linkedin.com", "youtube.com",
+    "msn.com",  # redirects to stub/privacy pages, no usable content
+    # Consistently HTTP 403 — wasted fetch slots
+    "forbes.com", "edmunds.com", "cars.com", "nytimes.com",
+    "percona.com", "mctlaw.com", "zenodo.org", "amjmed.com", "dl.acm.org",
+    "nejm.org", "cell.com", "sciencedirect.com", "onlinelibrary.wiley.com",
     # twitter.com, x.com: unblocked — FxTwitter API for tweet text
     # reddit.com: unblocked — Reddit JSON API for posts + comments
     # medium.com: unblocked — full articles extract cleanly
@@ -83,6 +89,11 @@ SKIP_URL_PATTERNS: Tuple[str, ...] = (
     r"/login", r"/signin", r"/signup", r"/cart", r"/checkout",
     r"/tag/", r"/tags/", r"/category/", r"/categories/",
     r"/archive/", r"/page/\d+",
+    r"bing\.com/aclick",  # Bing ad redirects — marketing/booking noise
+    r"www\.yahoo\.com/",  # EU privacy consent walls, no usable content
+    r"finance\.yahoo\.com/",  # EU privacy consent walls
+    r"www\.aol\.com/",  # cookie/privacy consent walls
+    # tech.yahoo.com: unblocked — returns actual article content
     # .pdf: now handled via pdftotext extraction
 )
 
@@ -160,6 +171,10 @@ RE_FORUM_NOISE = re.compile(
     r')',
     re.MULTILINE | re.IGNORECASE,
 )
+
+# Domains where curl_cffi c-ares DNS resolver fails (Windows).
+# Populated at runtime; domains in this set skip straight to httpx fallback.
+_CURL_DNS_FAIL_DOMAINS: set = set()
 
 # External tool availability (checked once at import)
 PDFTOTEXT_PATH = shutil.which("pdftotext")
@@ -757,8 +772,8 @@ def _extract_with_scrapling_fallback(page, min_length: int) -> str:
 
 
 def _is_pdf(raw: str, url: str) -> bool:
-    """Detect PDF content by magic bytes or URL."""
-    return "%PDF" in raw[:50] or url.lower().endswith(".pdf")
+    """Detect PDF content by magic bytes (not URL — .pdf URLs may return HTML 404)."""
+    return "%PDF" in raw[:50]
 
 
 def _extract_pdf(raw_bytes: bytes) -> str:
@@ -1106,7 +1121,33 @@ async def fetch_single_async(
             if progress:
                 progress.url_result(url, False, elapsed, "API failed")
             return result
-        page = await AsyncFetcher.get(url, timeout=timeout, stealthy_headers=True)
+        _host = urllib.parse.urlparse(url).hostname or ""
+        _use_httpx = _host in _CURL_DNS_FAIL_DOMAINS
+        if not _use_httpx:
+            try:
+                page = await asyncio.wait_for(
+                    AsyncFetcher.get(url, timeout=timeout, stealthy_headers=True),
+                    timeout=min(timeout, 5),  # hard cutoff — DNS should resolve in <1s
+                )
+            except (asyncio.TimeoutError, Exception) as _fetch_err:
+                if isinstance(_fetch_err, asyncio.TimeoutError) or "Resolving timed out" in str(_fetch_err):
+                    _CURL_DNS_FAIL_DOMAINS.add(_host)
+                    _use_httpx = True
+                else:
+                    raise
+        if _use_httpx:
+            # curl_cffi c-ares DNS fails for this domain — use httpx (system DNS)
+            import httpx
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=timeout,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            ) as _hx:
+                _resp = await _hx.get(url)
+            page = types.SimpleNamespace(
+                status=_resp.status_code,
+                html_content=_resp.text,
+                body=_resp.content,
+            )
         elapsed = time.monotonic() - t0
 
         if page.status != 200:
@@ -1212,13 +1253,20 @@ def _load_brave_api_key() -> Optional[str]:
         return None
 
 
+_RE_HTML_TAGS = re.compile(r"<[^>]+>")
+
 def _snippet_relevance(query: str, title: str, snippet: str) -> float:
-    """Score snippet relevance to query by word overlap. Returns 0.0-1.0."""
+    """Score snippet relevance to query by substring match. Returns 0.0-1.0.
+
+    Uses substring matching instead of word-set intersection because DDG's
+    ddgs library strips <b> tags without adding spaces, concatenating adjacent
+    words (e.g. "theCRISPRsicklecelltherapy"). Substring match handles this.
+    """
     query_words = set(query.lower().split())
-    text_words = set((title + " " + snippet).lower().split())
+    text = _RE_HTML_TAGS.sub(" ", (title + " " + snippet)).lower()
     if not query_words:
         return 1.0
-    return len(query_words & text_words) / len(query_words)
+    return sum(1 for w in query_words if w in text) / len(query_words)
 
 
 class BraveSearch:
@@ -1459,6 +1507,9 @@ async def run_research_async(
                 # Always enqueue at least 5 URLs (safety net for edge cases)
                 relevance = _snippet_relevance(config.query, title, snippet)
                 if relevance == 0 and enqueued >= 5:
+                    if progress.verbose:
+                        _host = urllib.parse.urlparse(url).hostname or url
+                        print(f"  [skip] {_host} relevance=0 | {title[:50]}", flush=True)
                     skipped += 1
                     continue
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
@@ -1514,8 +1565,15 @@ async def run_research_async(
                 try:
                     import urllib.request
                     import xml.etree.ElementTree as ET
-                    encoded = urllib.parse.quote_plus(config.query)
-                    api_url = f"http://export.arxiv.org/api/query?search_query=all:{encoded}&start=0&max_results=5&sortBy=relevance"
+                    # Strip dates/filler, use AND between core terms for precision
+                    _arxiv_skip = {"recent", "latest", "new", "advances", "applications",
+                                   "current", "overview", "update", "the", "and", "for", "with", "from"}
+                    words = [w for w in config.query.split()
+                             if not re.match(r'^\d{4}$', w) and w.lower() not in _arxiv_skip]
+                    core = words[:4]  # max 4 key terms
+                    arxiv_query = " AND ".join(f"all:{w}" for w in core) if core else config.query
+                    encoded = urllib.parse.quote_plus(arxiv_query)
+                    api_url = f"http://export.arxiv.org/api/query?search_query={encoded}&start=0&max_results=5&sortBy=relevance"
                     req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
                     with urllib.request.urlopen(req, timeout=8) as resp:
                         xml_data = resp.read().decode("utf-8", errors="replace")
@@ -1551,9 +1609,23 @@ async def run_research_async(
                 except Exception:
                     pass
 
+            def _bonus_pubmed():
+                """Search PubMed via NCBI E-utilities (free, no key)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={encoded}&retmax=5&retmode=json&sort=relevance"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for pmid in (data.get("esearchresult", {}).get("idlist") or []):
+                        _enqueue_bonus(f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/")
+                except Exception:
+                    pass
+
             bonus_fns = [_bonus_news, _bonus_reddit]
             if _is_academic_query(config.query):
-                bonus_fns.extend([_bonus_arxiv, _bonus_semantic_scholar])
+                bonus_fns.extend([_bonus_arxiv, _bonus_semantic_scholar, _bonus_pubmed])
             with ThreadPoolExecutor(max_workers=len(bonus_fns)) as bonus_pool:
                 list(bonus_pool.map(lambda f: f(), bonus_fns))
 

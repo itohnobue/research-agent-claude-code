@@ -21,11 +21,13 @@ This agent uses DuckDuckGo to fetch and process 50+ pages per query — similar 
 ## Features
 
 - **Deep Search**: 50+ results via DuckDuckGo + Brave Search fallback
-- **Anti-Bot Bypass**: Scrapling with TLS fingerprinting — passes where httpx gets 403'd
+- **Anti-Bot Bypass**: Scrapling with TLS fingerprinting — passes where httpx gets 403'd. Auto-fallback to httpx for domains where curl_cffi DNS fails
 - **Smart Extraction**: Trafilatura content-area detection (article body, not nav/sidebar noise)
+- **PDF Extraction**: Automatic pdftotext (poppler) extraction for PDF content
 - **Token Compression**: Sentence-level BM25 + centrality scoring keeps the most relevant sentences within budget
 - **Cross-Page Dedup**: Removes duplicate sentences across pages so later results only add new information
-- **Bonus Sources**: Supplements web results with DDG News + Reddit discussions (searched in parallel), plus arXiv and Semantic Scholar for academic queries
+- **Bonus Sources**: Supplements web results with DDG News + Reddit discussions (searched in parallel), plus arXiv, Semantic Scholar, and PubMed for academic queries
+- **Non-English Support**: Auto-detects query language (Japanese, Chinese, Korean, Russian, Arabic, Thai) and sets DDG region for better results
 - **Observable**: Per-phase timing, failure breakdown, slow URL identification
 - **Zero Setup**: Auto-installs dependencies via uv
 
@@ -33,11 +35,15 @@ This agent uses DuckDuckGo to fetch and process 50+ pages per query — similar 
 
 - **uv**: Auto-installed by wrapper scripts
 - **Python 3.11+**: Auto-installed by uv if needed
+- **pdftotext** (optional): From [poppler](https://poppler.freedesktop.org/) — enables PDF text extraction. Without it, PDF pages are skipped
 
 ## Blocked Domains
 
-Automatically filtered (no usable text content):
-facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.com
+Automatically filtered:
+
+**No usable content**: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.com, msn.com
+
+**Consistently HTTP 403** (paywalled/anti-scraper): forbes.com, nytimes.com, edmunds.com, cars.com, nejm.org, cell.com, sciencedirect.com, onlinelibrary.wiley.com, dl.acm.org, zenodo.org, percona.com, mctlaw.com, amjmed.com
 
 ## API-Routed Domains
 
@@ -58,6 +64,7 @@ For queries detected as scientific/academic, the tool automatically supplements 
 
 - **arXiv API Search**: Queries arXiv for relevant papers (5 results, sorted by relevance)
 - **Semantic Scholar API Search**: Queries S2 for papers across all disciplines (5 results, prefers arXiv URLs when available)
+- **PubMed Search**: Queries NCBI E-utilities for biomedical literature (5 results)
 
 Detection uses keyword heuristics — strong signals (e.g., "paper", "clinical trial", "arxiv") trigger immediately; weak signals (e.g., "research", "algorithm", "quantum") require 2+ matches. Non-academic queries skip these bonuses entirely.
 
