@@ -26,7 +26,7 @@ This agent uses DuckDuckGo to fetch and process 50+ pages per query — similar 
 - **PDF Extraction**: Automatic pdftotext (poppler) extraction for PDF content
 - **Token Compression**: Sentence-level BM25 + centrality scoring keeps the most relevant sentences within budget
 - **Cross-Page Dedup**: Removes duplicate sentences across pages so later results only add new information
-- **Bonus Sources**: Supplements web results with DDG News + Reddit discussions (searched in parallel). Scientific (`--sci`) and medical (`--med`) flags enable academic sources: arXiv, OpenAlex, PubMed, Europe PMC
+- **Bonus Sources**: Supplements web results with DDG News + Reddit discussions (searched in parallel). Scientific (`--sci`), medical (`--med`), and tech (`--tech`) flags enable domain-specific sources
 - **Non-English Support**: Auto-detects query language (Japanese, Chinese, Korean, Russian, Arabic, Thai) and sets DDG region for better results
 - **Observable**: Per-phase timing, failure breakdown, slow URL identification
 - **Zero Setup**: Auto-installs dependencies via uv
@@ -59,22 +59,30 @@ These websites are used via APIs:
 | semanticscholar.org | Semantic Scholar API | Paper metadata + abstract + citations |
 | europepmc.org | Europe PMC REST API | Paper metadata + OA full-text links |
 
-## Academic Search
+## Domain-Specific Search
 
-Use `--sci` and/or `--med` flags to enable academic bonus sources:
+Use `--sci`, `--med`, and/or `--tech` flags to enable domain-specific bonus sources:
 
 | Flag | Sources | Best for |
 |------|---------|----------|
 | `--sci` | arXiv + OpenAlex | CS, physics, math, engineering, materials science |
 | `--med` | PubMed + Europe PMC + OpenAlex | Medicine, clinical trials, pharmacology, biomedical |
-| `--sci --med` | All sources | Interdisciplinary (bioinformatics, medical imaging AI) |
+| `--tech` | Hacker News + Stack Overflow + Dev.to + GitHub | Software development, DevOps, IT, startups |
+| `--sci --med` | All academic sources | Interdisciplinary (bioinformatics, medical imaging AI) |
 
-**Sources:**
+**Academic Sources (`--sci`, `--med`):**
 
 - **arXiv API**: Preprint papers (5 results, sorted by relevance). Falls back to Semantic Scholar if arXiv returns nothing
 - **OpenAlex**: 250M+ works across all disciplines — covers IEEE, ACM, Springer, Elsevier (5 results, prefers OA URLs)
 - **PubMed**: NCBI E-utilities for biomedical literature (5 results)
 - **Europe PMC**: European PubMed Central — broader OA full-text coverage than PubMed (5 results, sorted by citations)
+
+**Tech Sources (`--tech`):**
+
+- **Hacker News**: Algolia search API — top stories by relevance (5 results)
+- **Stack Overflow**: Stack Exchange API — Q&A with code snippets (5 results, sorted by relevance)
+- **Dev.to**: Forem API — developer blog articles and tutorials (5 results)
+- **GitHub**: Repository search API — top repos by stars (5 results)
 
 All APIs are free with no keys required.
 

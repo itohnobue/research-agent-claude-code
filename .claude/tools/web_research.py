@@ -209,6 +209,7 @@ class ResearchConfig:
     stream: bool = False
     scientific: bool = False
     medical: bool = False
+    tech: bool = False
 
 
 @dataclass
@@ -1705,6 +1706,100 @@ async def run_research_async(
                 except Exception:
                     pass
 
+            def _bonus_hackernews():
+                """Search Hacker News via Algolia API (free, no key, 10K/hr)."""
+                try:
+                    import urllib.request
+                    # Use top 3 key terms to avoid zero-result long queries
+                    _hn_skip = {"best", "practices", "latest", "recent", "new", "how", "what",
+                                "the", "and", "for", "with", "from", "using", "guide", "tutorial"}
+                    words = [w for w in config.query.split() if w.lower() not in _hn_skip][:3]
+                    hn_query = " ".join(words) if words else config.query
+                    encoded = urllib.parse.quote_plus(hn_query)
+                    api_url = f"https://hn.algolia.com/api/v1/search?query={encoded}&tags=story&hitsPerPage=5"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for hit in (data.get("hits") or []):
+                        url = hit.get("url")
+                        if url:
+                            _enqueue_bonus(url, "hackernews")
+                        else:
+                            # Ask HN / Show HN posts without external URL — link to HN discussion
+                            story_id = hit.get("objectID")
+                            if story_id:
+                                _enqueue_bonus(f"https://news.ycombinator.com/item?id={story_id}", "hackernews")
+                except Exception:
+                    pass
+
+            def _bonus_stackoverflow():
+                """Search Stack Overflow API (free, no key, 300/day unauth)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://api.stackexchange.com/2.3/search/excerpts?order=desc&sort=relevance&q={encoded}&site=stackoverflow&pagesize=5&filter=default"
+                    req = urllib.request.Request(api_url, headers={
+                        "User-Agent": "web-research-tool/1.0",
+                        "Accept-Encoding": "gzip",
+                    })
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        # SO API always returns gzip
+                        raw = resp.read()
+                        if resp.headers.get("Content-Encoding") == "gzip":
+                            import gzip
+                            raw = gzip.decompress(raw)
+                        data = json.loads(raw.decode("utf-8", errors="replace"))
+                    for item in (data.get("items") or []):
+                        qid = item.get("question_id")
+                        if qid:
+                            _enqueue_bonus(f"https://stackoverflow.com/questions/{qid}", "stackoverflow")
+                except Exception:
+                    pass
+
+            def _bonus_devto():
+                """Search Dev.to API for articles (free, no key)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    # Dev.to doesn't have keyword search in API, but per_page+tag works
+                    # Use page=1&per_page=5 with the query as tag approximation
+                    # Actually, the /articles endpoint does support a hidden 'q' param via Forem
+                    api_url = f"https://dev.to/api/articles?per_page=5&top=365"
+                    # Try tag-based search with first keyword
+                    words = config.query.split()
+                    if words:
+                        tag = re.sub(r'[^a-zA-Z0-9]', '', words[0]).lower()
+                        if tag:
+                            api_url += f"&tag={tag}"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for article in (data if isinstance(data, list) else []):
+                        url = article.get("url")
+                        if url:
+                            _enqueue_bonus(url, "devto")
+                except Exception:
+                    pass
+
+            def _bonus_github_repos():
+                """Search GitHub repositories API (free, no key, 10/min unauth)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://api.github.com/search/repositories?q={encoded}&sort=stars&per_page=5"
+                    req = urllib.request.Request(api_url, headers={
+                        "User-Agent": "web-research-tool/1.0",
+                        "Accept": "application/vnd.github.v3+json",
+                    })
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for repo in (data.get("items") or []):
+                        url = repo.get("html_url")
+                        if url:
+                            _enqueue_bonus(url, "github")
+                except Exception:
+                    pass
+
             bonus_fns = [_bonus_news, _bonus_reddit]
             if config.scientific:
                 bonus_fns.extend([_bonus_arxiv, _bonus_openalex])
@@ -1712,6 +1807,8 @@ async def run_research_async(
                 bonus_fns.extend([_bonus_pubmed, _bonus_europepmc])
                 if not config.scientific:
                     bonus_fns.append(_bonus_openalex)
+            if config.tech:
+                bonus_fns.extend([_bonus_hackernews, _bonus_stackoverflow, _bonus_devto, _bonus_github_repos])
             with ThreadPoolExecutor(max_workers=len(bonus_fns)) as bonus_pool:
                 list(bonus_pool.map(lambda f: f(), bonus_fns))
 
@@ -2133,6 +2230,8 @@ Blocked domains: facebook, youtube, tiktok, instagram, linkedin
                         help="Enable scientific bonus sources (arXiv, OpenAlex)")
     parser.add_argument("--med", action="store_true",
                         help="Enable medical bonus sources (PubMed, Europe PMC, OpenAlex)")
+    parser.add_argument("--tech", action="store_true",
+                        help="Enable tech bonus sources (Hacker News, Stack Overflow, Dev.to, GitHub)")
     parser.add_argument("--quality", action="store_true",
                         help="Include output quality analysis (with --usage)")
 
@@ -2204,6 +2303,7 @@ Blocked domains: facebook, youtube, tiktok, instagram, linkedin
             stream=args.stream,
             scientific=args.sci,
             medical=args.med,
+            tech=args.tech,
         )
 
     # Hard wall-clock timeout: kill the entire process after 5 minutes

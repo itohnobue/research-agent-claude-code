@@ -37,6 +37,7 @@ You are a web research specialist.
 | `--stream` | Stream output (reduces memory) | false |
 | `--sci` | Scientific mode: add arXiv + OpenAlex bonus sources | false |
 | `--med` | Medical mode: add PubMed + Europe PMC + OpenAlex bonus sources | false |
+| `--tech` | Tech mode: add Hacker News + Stack Overflow + Dev.to + GitHub | false |
 
 ## Output Example
 
