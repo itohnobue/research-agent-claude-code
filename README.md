@@ -26,7 +26,7 @@ This agent uses DuckDuckGo to fetch and process 50+ pages per query — similar 
 - **PDF Extraction**: Automatic pdftotext (poppler) extraction for PDF content
 - **Token Compression**: Sentence-level BM25 + centrality scoring keeps the most relevant sentences within budget
 - **Cross-Page Dedup**: Removes duplicate sentences across pages so later results only add new information
-- **Bonus Sources**: Supplements web results with DDG News + Reddit discussions (searched in parallel), plus arXiv, Semantic Scholar, and PubMed for academic queries
+- **Bonus Sources**: Supplements web results with DDG News + Reddit discussions (searched in parallel). Scientific (`--sci`) and medical (`--med`) flags enable academic sources: arXiv, OpenAlex, PubMed, Europe PMC
 - **Non-English Support**: Auto-detects query language (Japanese, Chinese, Korean, Russian, Arabic, Thai) and sets DDG region for better results
 - **Observable**: Per-phase timing, failure breakdown, slow URL identification
 - **Zero Setup**: Auto-installs dependencies via uv
@@ -52,21 +52,29 @@ These websites are used via APIs:
 | Domain | Method | Content |
 |---|---|---|
 | twitter.com, x.com | FxTwitter API | Tweet text, author, metrics |
-| reddit.com | Reddit JSON API | Post + top comments |
+| reddit.com | DDG snippet injection | Discussion titles + summaries |
 | en.wikipedia.org | MediaWiki API | Article text (no citation noise) |
 | github.com | GitHub REST API | README rendered to text |
 | arxiv.org | ArXiv Atom API | Paper metadata + abstract |
 | semanticscholar.org | Semantic Scholar API | Paper metadata + abstract + citations |
+| europepmc.org | Europe PMC REST API | Paper metadata + OA full-text links |
 
 ## Academic Search
 
-For queries detected as scientific/academic, the tool automatically supplements web results with:
+Use `--sci` and/or `--med` flags to enable academic bonus sources:
 
-- **arXiv API Search**: Queries arXiv for relevant papers (5 results, sorted by relevance)
-- **Semantic Scholar API Search**: Queries S2 for papers across all disciplines (5 results, prefers arXiv URLs when available)
-- **PubMed Search**: Queries NCBI E-utilities for biomedical literature (5 results)
+| Flag | Sources | Best for |
+|------|---------|----------|
+| `--sci` | arXiv + OpenAlex | CS, physics, math, engineering, materials science |
+| `--med` | PubMed + Europe PMC + OpenAlex | Medicine, clinical trials, pharmacology, biomedical |
+| `--sci --med` | All sources | Interdisciplinary (bioinformatics, medical imaging AI) |
 
-Detection uses keyword heuristics — strong signals (e.g., "paper", "clinical trial", "arxiv") trigger immediately; weak signals (e.g., "research", "algorithm", "quantum") require 2+ matches. Non-academic queries skip these bonuses entirely.
+**Sources:**
+
+- **arXiv API**: Preprint papers (5 results, sorted by relevance). Falls back to Semantic Scholar if arXiv returns nothing
+- **OpenAlex**: 250M+ works across all disciplines — covers IEEE, ACM, Springer, Elsevier (5 results, prefers OA URLs)
+- **PubMed**: NCBI E-utilities for biomedical literature (5 results)
+- **Europe PMC**: European PubMed Central — broader OA full-text coverage than PubMed (5 results, sorted by citations)
 
 All APIs are free with no keys required.
 

@@ -80,7 +80,7 @@ BLOCKED_DOMAINS: Tuple[str, ...] = (
     "percona.com", "mctlaw.com", "zenodo.org", "amjmed.com", "dl.acm.org",
     "nejm.org", "cell.com", "sciencedirect.com", "onlinelibrary.wiley.com",
     # twitter.com, x.com: unblocked — FxTwitter API for tweet text
-    # reddit.com: unblocked — Reddit JSON API for posts + comments
+    # reddit.com: unblocked — DDG snippets for bonus search, scraping fallback for DDG-found URLs
     # medium.com: unblocked — full articles extract cleanly
 )
 
@@ -207,6 +207,8 @@ class ResearchConfig:
     max_concurrent: int = 50  # Match default search count
     search_results: int = 50
     stream: bool = False
+    scientific: bool = False
+    medical: bool = False
 
 
 @dataclass
@@ -228,6 +230,7 @@ class ResearchStats:
     urls_fetched: int = 0
     urls_filtered: int = 0
     content_chars: int = 0
+    bonus_sources: dict = None  # {source_name: count}
 
 
 def _quality_fields(results: Optional[List[FetchResult]]) -> dict:
@@ -781,19 +784,29 @@ def _extract_pdf(raw_bytes: bytes) -> str:
     if not PDFTOTEXT_PATH:
         return ""
     import tempfile
+    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as f:
-            f.write(raw_bytes)
-            f.flush()
-            result = subprocess.run(
-                [PDFTOTEXT_PATH, "-layout", f.name, "-"],
-                capture_output=True,
-                timeout=30,
-            )
-            if result.returncode == 0:
-                return result.stdout.decode("utf-8", errors="replace").strip()
+        # Use delete=False and manual cleanup: on Windows, NamedTemporaryFile(delete=True)
+        # keeps the file locked, preventing pdftotext from reading it
+        f = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp_path = f.name
+        f.write(raw_bytes)
+        f.close()
+        result = subprocess.run(
+            [PDFTOTEXT_PATH, "-layout", tmp_path, "-"],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            return result.stdout.decode("utf-8", errors="replace").strip()
     except (subprocess.TimeoutExpired, OSError):
         pass
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
     return ""
 
 
@@ -1101,14 +1114,9 @@ async def fetch_single_async(
             api_content = await loop.run_in_executor(
                 None, _fetch_twitter_api, screen_name, tweet_id, max_content_length
             )
-        reddit_match = RE_REDDIT_URL.match(url) if not api_content else None
-        if reddit_match:
-            reddit_path = reddit_match.group(1)
-            api_content = await loop.run_in_executor(
-                None, _fetch_reddit_json, reddit_path, max_content_length
-            )
+        # Reddit: JSON API blocked (403) — skip API, fall through to scraping
         # For API-routed domains, if API failed, scraping won't help — bail early
-        api_only = tw_match or reddit_match
+        api_only = tw_match
         if api_content:
             elapsed = time.monotonic() - t0
             result = _create_fetch_result(url, api_content, min_content_length, max_content_length, query=query)
@@ -1516,7 +1524,9 @@ async def run_research_async(
                 enqueued += 1
 
             # Supplement with DDG video + news results (bonus URLs not in web search)
-            def _enqueue_bonus(url: str) -> None:
+            stats.bonus_sources = {}
+
+            def _enqueue_bonus(url: str, source: str = "") -> None:
                 nonlocal enqueued
                 if url in seen_in_search or not is_valid_url(url) or is_blocked_url(url):
                     return
@@ -1527,6 +1537,8 @@ async def run_research_async(
                 seen_in_search.add(url)
                 urls.append(url)
                 stats.urls_searched = len(urls)
+                if source:
+                    stats.bonus_sources[source] = stats.bonus_sources.get(source, 0) + 1
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
@@ -1541,27 +1553,44 @@ async def run_research_async(
                     for r in ddg.news(config.query, max_results=5, **news_kwargs):
                         url = r.get("url", "")
                         if url:
-                            _enqueue_bonus(url)
+                            _enqueue_bonus(url, "news")
                 except Exception:
                     pass
 
             def _bonus_reddit():
+                """Search DDG for reddit discussions, inject snippet content directly
+                (reddit blocks all scraping/API access, so we use DDG snippets)."""
                 try:
-                    import urllib.request
-                    reddit_q = urllib.parse.quote(config.query)
-                    api_url = f"https://www.reddit.com/search.json?q={reddit_q}&sort=relevance&limit=5"
-                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0 (research)"})
-                    with urllib.request.urlopen(req, timeout=5) as resp:
-                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                    for child in data.get("data", {}).get("children", []):
-                        permalink = child.get("data", {}).get("permalink", "")
-                        if permalink:
-                            _enqueue_bonus(f"https://www.reddit.com{permalink}")
+                    ddg = DDGS(verify=False)
+                    count = 0
+                    for r in ddg.text(f"{config.query} site:reddit.com", max_results=5):
+                        url = r.get("href", "")
+                        if not url or "reddit.com" not in url:
+                            continue
+                        if url in seen_in_search or not is_valid_url(url):
+                            continue
+                        if global_seen_urls is not None:
+                            if url in global_seen_urls:
+                                continue
+                            global_seen_urls.add(url)
+                        seen_in_search.add(url)
+                        title = r.get("title", "")
+                        body = r.get("body", "")
+                        content = f"# {title}\n\n{body}" if title else body
+                        if not content or len(content) < 50:
+                            continue
+                        result = FetchResult(url=url, success=True, content=content[:config.max_content_length])
+                        loop.call_soon_threadsafe(result_queue.put_nowait, result)
+                        urls.append(url)
+                        stats.urls_searched = len(urls)
+                        stats.bonus_sources["reddit"] = stats.bonus_sources.get("reddit", 0) + 1
+                        count += 1
                 except Exception:
                     pass
 
             def _bonus_arxiv():
-                """Search arXiv API for relevant papers (free, no key)."""
+                """Search arXiv API, fallback to Semantic Scholar if arXiv fails."""
+                arxiv_ok = False
                 try:
                     import urllib.request
                     import xml.etree.ElementTree as ET
@@ -1583,31 +1612,31 @@ async def run_research_async(
                         for link in entry.findall("atom:link", ns):
                             href = link.get("href", "")
                             if "arxiv.org/abs/" in href:
-                                _enqueue_bonus(href)
+                                _enqueue_bonus(href, "arxiv")
+                                arxiv_ok = True
                                 break
                 except Exception:
                     pass
-
-            def _bonus_semantic_scholar():
-                """Search Semantic Scholar API for papers (free, no key, 1 req/s)."""
-                try:
-                    import urllib.request
-                    encoded = urllib.parse.quote_plus(config.query)
-                    api_url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={encoded}&limit=5&fields=url,externalIds"
-                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-                    with urllib.request.urlopen(req, timeout=8) as resp:
-                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                    for paper in (data.get("data") or []):
-                        ext_ids = paper.get("externalIds") or {}
-                        arxiv_id = ext_ids.get("ArXiv")
-                        if arxiv_id:
-                            _enqueue_bonus(f"https://arxiv.org/abs/{arxiv_id}")
-                        else:
-                            paper_id = paper.get("paperId", "")
-                            if paper_id:
-                                _enqueue_bonus(f"https://www.semanticscholar.org/paper/{paper_id}")
-                except Exception:
-                    pass
+                # Fallback: Semantic Scholar if arXiv returned nothing
+                if not arxiv_ok:
+                    try:
+                        import urllib.request
+                        encoded = urllib.parse.quote_plus(config.query)
+                        api_url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={encoded}&limit=10&fields=url,externalIds"
+                        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                        with urllib.request.urlopen(req, timeout=8) as resp:
+                            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                        for paper in (data.get("data") or []):
+                            ext_ids = paper.get("externalIds") or {}
+                            arxiv_id = ext_ids.get("ArXiv")
+                            if arxiv_id:
+                                _enqueue_bonus(f"https://arxiv.org/abs/{arxiv_id}", "scholar")
+                            else:
+                                paper_id = paper.get("paperId", "")
+                                if paper_id:
+                                    _enqueue_bonus(f"https://www.semanticscholar.org/paper/{paper_id}", "scholar")
+                    except Exception:
+                        pass
 
             def _bonus_pubmed():
                 """Search PubMed via NCBI E-utilities (free, no key)."""
@@ -1619,13 +1648,70 @@ async def run_research_async(
                     with urllib.request.urlopen(req, timeout=8) as resp:
                         data = json.loads(resp.read().decode("utf-8", errors="replace"))
                     for pmid in (data.get("esearchresult", {}).get("idlist") or []):
-                        _enqueue_bonus(f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/")
+                        _enqueue_bonus(f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/", "pubmed")
+                except Exception:
+                    pass
+
+            def _bonus_openalex():
+                """Search OpenAlex for papers (free, no key for basic search)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://api.openalex.org/works?search={encoded}&per_page=5&mailto=web-research-tool@example.com"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for work in (data.get("results") or []):
+                        # Prefer open access URL, then DOI, then landing page
+                        oa = work.get("open_access") or {}
+                        url = oa.get("oa_url")
+                        if not url:
+                            doi = work.get("doi")
+                            if doi:
+                                url = doi  # DOI URLs like https://doi.org/10.1234/...
+                        if not url:
+                            loc = work.get("primary_location") or {}
+                            url = loc.get("landing_page_url")
+                        if url:
+                            _enqueue_bonus(url, "openalex")
+                except Exception:
+                    pass
+
+            def _bonus_europepmc():
+                """Search Europe PMC for papers (free, no key, more OA full-text than PubMed)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={encoded}&format=json&pageSize=5&sort=CITED%20desc"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for result in (data.get("resultList", {}).get("result") or []):
+                        # Prefer full-text URL, then DOI, then Europe PMC page
+                        url = None
+                        doi = result.get("doi")
+                        if doi:
+                            url = f"https://doi.org/{doi}"
+                        if not url:
+                            pmcid = result.get("pmcid")
+                            if pmcid:
+                                url = f"https://europepmc.org/article/PMC/{pmcid}"
+                            else:
+                                pmid = result.get("pmid")
+                                if pmid:
+                                    url = f"https://europepmc.org/article/MED/{pmid}"
+                        if url:
+                            _enqueue_bonus(url, "europepmc")
                 except Exception:
                     pass
 
             bonus_fns = [_bonus_news, _bonus_reddit]
-            if _is_academic_query(config.query):
-                bonus_fns.extend([_bonus_arxiv, _bonus_semantic_scholar, _bonus_pubmed])
+            if config.scientific:
+                bonus_fns.extend([_bonus_arxiv, _bonus_openalex])
+            if config.medical:
+                bonus_fns.extend([_bonus_pubmed, _bonus_europepmc])
+                if not config.scientific:
+                    bonus_fns.append(_bonus_openalex)
             with ThreadPoolExecutor(max_workers=len(bonus_fns)) as bonus_pool:
                 list(bonus_pool.map(lambda f: f(), bonus_fns))
 
@@ -1639,6 +1725,9 @@ async def run_research_async(
                 source_info += " (DDG+Brave)"
             else:
                 source_info += " (DDG)"
+            if stats.bonus_sources:
+                bonus_parts = [f"{v} {k}" for k, v in sorted(stats.bonus_sources.items())]
+                source_info += f" + bonus: {', '.join(bonus_parts)}"
             if skipped:
                 source_info += f", {skipped} filtered"
             progress.message(f"  [search] {source_info} in {search_elapsed:.1f}s")
@@ -1991,6 +2080,9 @@ def run_research(config: ResearchConfig, verbose: bool = False) -> Optional[List
 
 def main() -> None:
     """Main entry point."""
+    # Force UTF-8 stdout on Windows (avoids cp1251/charmap encoding errors)
+    if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="Web Research Tool - Search + Fetch with TLS fingerprinting (Scrapling)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2037,6 +2129,10 @@ Blocked domains: facebook, youtube, tiktok, instagram, linkedin
                         help="Global char budget across all pages (0 = unlimited)")
     parser.add_argument("--usage", action="store_true",
                         help="Show usage statistics (last 30 days)")
+    parser.add_argument("--sci", action="store_true",
+                        help="Enable scientific bonus sources (arXiv, OpenAlex)")
+    parser.add_argument("--med", action="store_true",
+                        help="Enable medical bonus sources (PubMed, Europe PMC, OpenAlex)")
     parser.add_argument("--quality", action="store_true",
                         help="Include output quality analysis (with --usage)")
 
@@ -2106,6 +2202,8 @@ Blocked domains: facebook, youtube, tiktok, instagram, linkedin
             max_concurrent=args.concurrent,
             search_results=args.search,
             stream=args.stream,
+            scientific=args.sci,
+            medical=args.med,
         )
 
     # Hard wall-clock timeout: kill the entire process after 5 minutes
