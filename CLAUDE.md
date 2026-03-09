@@ -5,8 +5,9 @@
 For any internet search:
 
 1. Run `./.claude/tools/web_search.sh "query"` — searches, fetches, and summarizes via Gemini Flash (default)
-2. Use `-s N` for result count, `-f N` for fetch limit, `-v` for per-URL timing, `--no-summarize` for raw output
-3. Summarization is on by default (~10-20x compression, preserves all technical details). Requires `GEMINI_API_KEY` env var; falls back to raw output if unset
+2. **Multiple queries: always combine into one call** — `./.claude/tools/web_search.sh "query1" "query2" "query3" -s 10`. Runs in parallel with cross-query URL dedup. Never make separate Bash calls for related queries.
+3. Use `-s N` for result count, `-f N` for fetch limit, `-v` for per-URL timing, `--no-summarize` for raw output
+4. Summarization is on by default (~10-20x compression, preserves all technical details). Requires `GEMINI_API_KEY` env var; falls back to raw output if unset
 
 **Note**: Always use forward slashes (`/`) in paths, even on Windows.
 Dependencies handled automatically via uv.
@@ -18,4 +19,6 @@ Dependencies handled automatically via uv.
 - **StealthyFetcher** auto-retry for blocked/CAPTCHA pages (disable with `--no-stealth`)
 - **Text extraction**: Trafilatura (content-area detection, boilerplate removal) > regex fallback
 - **Summarization** (default): Gemini Flash API summarizes results (~10x compression). Disable with `--no-summarize`
+- **Search Memory**: SQLite cache with nomic-embed-text embeddings — `--cache-only` for instant recall, `--no-cache` to bypass, `--cache-stats` for stats
+- **Source Authority**: ~100 hardcoded domain scores (1.0 official docs → 0.3 content farms) used in cache ranking
 - **BM25 compression** (legacy, not recommended): `-g N` enables sentence-level compression. Hurts factual accuracy

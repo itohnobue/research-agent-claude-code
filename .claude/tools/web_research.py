@@ -1981,6 +1981,14 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Summarize results via Gemini Flash (default: on, reduces output ~10x)")
     parser.add_argument("--no-summarize", action="store_true",
                         help="Disable Gemini summarization, output raw text")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Skip cache lookup and write")
+    parser.add_argument("--cache-only", action="store_true",
+                        help="Only return cached results, no web fetch")
+    parser.add_argument("--cache-stats", action="store_true",
+                        help="Print cache statistics and exit")
+    parser.add_argument("--max-age", type=int, default=168,
+                        help="Max cache age in hours (default: 168 = 7 days)")
     parser.add_argument("--usage", action="store_true",
                         help="Show usage statistics (last 30 days)")
     parser.add_argument("--quality", action="store_true",
@@ -1990,6 +1998,14 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
 
     if args.usage or args.quality:
         print_usage_stats(quality=args.quality)
+        sys.exit(0)
+
+    if args.cache_stats:
+        _tools_dir = os.path.dirname(os.path.abspath(__file__))
+        if _tools_dir not in sys.path:
+            sys.path.insert(0, _tools_dir)
+        from search_cache import SearchCache
+        SearchCache().print_stats()
         sys.exit(0)
 
     # --no-summarize overrides -S default
@@ -2082,11 +2098,70 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
     signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(_WALL_TIMEOUT)
 
+    # Initialize cache (unless disabled)
+    cache = None
+    if not args.no_cache:
+        try:
+            _tools_dir = os.path.dirname(os.path.abspath(__file__))
+            if _tools_dir not in sys.path:
+                sys.path.insert(0, _tools_dir)
+            from search_cache import SearchCache
+            cache = SearchCache()
+        except Exception as e:
+            logger.debug(f"Cache unavailable: {e}")
+
+    def _cache_write_results(results: List[FetchResult], query: str) -> None:
+        """Write successful fetch results to cache (best-effort)."""
+        if not cache:
+            return
+        for r in results:
+            if r.success and r.content:
+                try:
+                    domain = urllib.parse.urlparse(r.url).netloc
+                    cache.store(r.url, domain, r.title, r.content, query)
+                except Exception:
+                    pass
+
+    def _cache_hits_to_results(query: str) -> Optional[List[FetchResult]]:
+        """Check cache for hits. Returns FetchResult list or None."""
+        if not cache:
+            return None
+        try:
+            hits = cache.lookup(query, max_age_hours=args.max_age)
+            if hits:
+                progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
+                progress.message(f"  [cache] {len(hits)} cached results (best sim={hits[0].similarity:.2f}, authority={hits[0].authority:.1f})")
+                return [
+                    FetchResult(url=h.url, success=True, content=h.content, title=h.title, source="cache")
+                    for h in hits
+                ]
+        except Exception as e:
+            logger.debug(f"Cache lookup failed: {e}")
+        return None
+
     try:
         if len(queries) == 1:
-            # Single query: original behavior
+            # Single query: check cache first, then web search
             config = make_config(queries[0])
             t0 = time.monotonic()
+
+            # Cache-only mode
+            if args.cache_only:
+                cached = _cache_hits_to_results(config.query)
+                if cached:
+                    if args.output == "json":
+                        print(format_batch_json(cached, config.query))
+                    else:
+                        raw = format_batch_raw(cached)
+                        if args.summarize:
+                            progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
+                            raw = _gemini_summarize(raw, config.query, progress)
+                        print(raw)
+                else:
+                    print("No cached results found", file=sys.stderr)
+                    sys.exit(1)
+                sys.exit(0)
+
             if args.stream:
                 run_research(config, verbose=args.verbose)
                 log_usage({
@@ -2099,6 +2174,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             else:
                 results = run_research(config, verbose=args.verbose)
                 ok = [r for r in (results or []) if r.success]
+
+                # Write results to cache
+                _cache_write_results(ok, config.query)
+
                 log_usage({
                     "query": config.query, "mode": "search",
                     "urls_fetched": len(ok),
@@ -2166,6 +2245,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             dedup_fuzzy: Set[str] = set()
             for query, results in all_results:
                 ok = [r for r in results if r.success]
+                _cache_write_results(ok, query)
                 log_usage({
                     "query": query, "mode": "multi",
                     "urls_fetched": len(ok),

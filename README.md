@@ -28,13 +28,17 @@ This agent uses DuckDuckGo + Brave to fetch and process 50+ pages per query — 
 - **Cross-Page Dedup**: Removes duplicate sentences across pages so later results only add new information
 - **Bonus Sources**: Supplements web results with DDG News + Reddit discussions (searched in parallel)
 - **Snippet Pre-Filter**: Scores search snippets by query relevance, skips irrelevant URLs before fetching
+- **Search Memory**: SQLite cache with vector embeddings — repeated/similar queries return from cache instantly
+- **Source Authority**: Hardcoded domain tier map (~100 domains) ranks authoritative sources higher
 - **Observable**: Per-phase timing, failure breakdown, slow URL identification
+- **Gemini Summarization**: Results summarized via Gemini Flash by default (~10x compression, preserves technical details)
 - **Zero Setup**: Auto-installs dependencies via uv
 
 ## Requirements
 
 - **[uv](https://github.com/astral-sh/uv)**: Auto-installed by wrapper scripts
 - **Python 3.11+**: Auto-installed by uv if needed
+- **[Ollama](https://ollama.com/)** with `nomic-embed-text` (optional, for Search Memory): `ollama pull nomic-embed-text`
 
 ## Brave Search (Optional)
 
@@ -93,6 +97,10 @@ Slow URLs (>5s) are always listed in the summary, even without `-v`. Low success
 -u URL ...    Direct URL fetch (skip search)
 --stream      Stream results as they arrive
 --no-stealth  Disable headless browser retry for blocked pages
+--no-cache    Skip cache lookup and write
+--cache-only  Only return cached results, no web fetch
+--cache-stats Print cache statistics and exit
+--max-age N   Max cache age in hours (default: 168 = 7 days)
 --usage       Show usage statistics (last 30 days)
 --quality     Show usage stats with output quality analysis
 ```
@@ -173,6 +181,18 @@ When `-g N` is set, all pages are compressed together to fit within N total char
 | Fuzzy dedup | ~0.5% on top of exact | Same | Same | Marginal |
 | Snippet pre-filter | 0% | Same | 20-40% faster | Speed only |
 | Global compression (`-g`) | 60% at g=30K | Good (BM25-focused) | Same | Opt-in, no GPU needed |
+
+## Search Memory
+
+Fetched pages are automatically cached in `~/.web-research/cache.db` (SQLite) with vector embeddings from [nomic-embed-text](https://ollama.com/library/nomic-embed-text) via Ollama. On subsequent queries, semantically similar cached pages are available instantly.
+
+Cache ranking: `similarity * 0.6 + authority * 0.3 + freshness * 0.1`
+
+- **Similarity**: Cosine similarity between query embedding and cached page embedding (threshold: 0.75)
+- **Authority**: Hardcoded domain tier map — 1.0 for official docs (docs.python.org, kubernetes.io), 0.9 for research/platforms (arxiv.org, github.com), down to 0.3 for content farms. Unknown domains default to 0.5.
+- **Freshness**: Linear decay from 1.0 (just fetched) to 0.0 (max-age hours old, default 7 days)
+
+Requires Ollama running locally with `nomic-embed-text`. Without Ollama, the cache is disabled silently — search works normally.
 
 ## Blocked Domains
 
