@@ -1281,6 +1281,36 @@ class BraveSearch:
             return
 
 
+def _detect_ddg_region(query: str) -> Optional[str]:
+    """Detect DDG region from query script (Unicode ranges). Returns None for Latin."""
+    scripts = {"ja": 0, "zh": 0, "ko": 0, "ru": 0, "ar": 0, "th": 0}
+    for ch in query:
+        cp = ord(ch)
+        if 0x3040 <= cp <= 0x30FF or 0x31F0 <= cp <= 0x31FF:  # Hiragana + Katakana
+            scripts["ja"] += 1
+        elif 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:  # CJK Unified
+            scripts["zh"] += 1  # tentative — overridden by ja if kana present
+        elif 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF:  # Hangul
+            scripts["ko"] += 1
+        elif 0x0400 <= cp <= 0x04FF:  # Cyrillic
+            scripts["ru"] += 1
+        elif 0x0600 <= cp <= 0x06FF:  # Arabic
+            scripts["ar"] += 1
+        elif 0x0E00 <= cp <= 0x0E7F:  # Thai
+            scripts["th"] += 1
+    # If kana detected, CJK chars are also Japanese
+    if scripts["ja"] > 0:
+        scripts["ja"] += scripts["zh"]
+        scripts["zh"] = 0
+    top = max(scripts, key=scripts.get)
+    if scripts[top] == 0:
+        return None
+    # Only CJK scripts benefit from region hints — Cyrillic/Arabic/Thai regional
+    # domains tend to have more aggressive bot protection, causing lower fetch rates
+    region_map = {"ja": "jp-jp", "zh": "zh-cn", "ko": "kr-kr"}
+    return region_map.get(top)
+
+
 class DuckDuckGoSearch:
     """DuckDuckGo search with early URL filtering."""
 
@@ -1288,13 +1318,17 @@ class DuckDuckGoSearch:
         self,
         query: str,
         num_results: int = 50,
+        region: Optional[str] = None,
     ) -> Iterator[Tuple[str, str, str]]:
         """Search DuckDuckGo and yield (url, title, snippet) tuples."""
         seen_urls: Set[str] = set()
         count = 0
 
         ddg = DDGS(verify=False)
-        for r in ddg.text(query, max_results=num_results * 2):
+        ddg_kwargs = {}
+        if region:
+            ddg_kwargs["region"] = region
+        for r in ddg.text(query, max_results=num_results * 2, **ddg_kwargs):
             url = r.get("href", "")
             if url and url not in seen_urls and is_valid_url(url) and not is_blocked_url(url):
                 seen_urls.add(url)
@@ -1318,11 +1352,12 @@ class MultiSearch:
         """Search DDG first. If under target, supplement with Brave."""
         seen_urls: Set[str] = set()
         count = 0
+        region = _detect_ddg_region(query)
 
         # Phase 1: DuckDuckGo (primary)
         ddg = DuckDuckGoSearch()
         try:
-            for url, title, snippet in ddg.search(query, num_results):
+            for url, title, snippet in ddg.search(query, num_results, region=region):
                 if url not in seen_urls:
                     seen_urls.add(url)
                     yield url, title, snippet
@@ -1443,10 +1478,14 @@ async def run_research_async(
                 enqueued += 1
 
             # Run bonus searches in parallel (news + reddit)
+            region = _detect_ddg_region(config.query)
             def _bonus_news():
                 try:
                     ddg = DDGS(verify=False)
-                    for r in ddg.news(config.query, max_results=5):
+                    news_kwargs = {}
+                    if region:
+                        news_kwargs["region"] = region
+                    for r in ddg.news(config.query, max_results=5, **news_kwargs):
                         url = r.get("url", "")
                         if url:
                             _enqueue_bonus(url)
